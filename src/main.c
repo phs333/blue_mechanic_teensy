@@ -4,6 +4,8 @@
 #include <drivers/gpio.h>
 #include <drivers/uart.h>
 #include <errno.h>
+#include <limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/atomic.h>
@@ -47,6 +49,7 @@
 #define CAN_OP_MOVE           0x20U
 #define CAN_OP_HOME           0x21U
 #define CAN_OP_MOVE_FORCE     0x22U
+#define CAN_OP_MOVE_SYNC      0x23U
 #define CAN_OP_LASER          0x30U
 #define CAN_OP_FAN            0x31U
 
@@ -378,6 +381,31 @@ static void format_deci(char *buf, size_t buf_size, int16_t value) {
              (long)(magnitude / 10), (long)(magnitude % 10));
 }
 
+static bool encode_sync_fixed(float value, float scale, int16_t *encoded) {
+    float scaled;
+    long rounded;
+
+    if (!isfinite(value) || encoded == NULL) {
+        return false;
+    }
+    scaled = value * scale;
+    if (scaled < (float)INT16_MIN || scaled > (float)INT16_MAX) {
+        return false;
+    }
+    rounded = lroundf(scaled);
+    if (rounded < INT16_MIN || rounded > INT16_MAX) {
+        return false;
+    }
+    *encoded = (int16_t)rounded;
+    return true;
+}
+
+static void encode_i16_le(uint8_t *dest, int16_t value) {
+    uint16_t raw = (uint16_t)value;
+    dest[0] = (uint8_t)(raw & 0xFFU);
+    dest[1] = (uint8_t)((raw >> 8) & 0xFFU);
+}
+
 /* Executado pelo driver FlexCAN em contexto de interrupção. Manter apenas
  * operações ISR-safe; a formatação e o envio USB ficam no loop principal. */
 static void can_tx_callback(uint32_t error_flags, void *arg) {
@@ -478,9 +506,38 @@ static void process_usb_command(const struct device *usb_dev,
         return;
     }
 
+    /* Movimento sincronizado físico (MS/MSF <node> <deg_c> <deg_a> <mm_z>) */
+    if ((strncmp(cmd, "MS ", 3) == 0 || strncmp(cmd, "ms ", 3) == 0 ||
+         strncmp(cmd, "MSF ", 4) == 0 || strncmp(cmd, "msf ", 4) == 0)) {
+        float angle_c_deg = 0.0f;
+        float angle_a_deg = 0.0f;
+        float distance_z_mm = 0.0f;
+        int16_t angle_c_deci = 0;
+        int16_t angle_a_deci = 0;
+        int16_t distance_z_centi = 0;
+        uint8_t payload[8];
+        bool force_sync = (strncmp(cmd, "MSF ", 4) == 0 ||
+                           strncmp(cmd, "msf ", 4) == 0);
+
+        if (sscanf(cmd, "%*s %u %f %f %f", &node_id, &angle_c_deg,
+                   &angle_a_deg, &distance_z_mm) != 4 ||
+            !encode_sync_fixed(angle_c_deg, 10.0f, &angle_c_deci) ||
+            !encode_sync_fixed(angle_a_deg, 10.0f, &angle_a_deci) ||
+            !encode_sync_fixed(distance_z_mm, 100.0f, &distance_z_centi)) {
+            write_invalid_argument(usb_dev, "MOVE_SYNC");
+            return;
+        }
+
+        payload[0] = CAN_OP_MOVE_SYNC;
+        encode_i16_le(&payload[1], angle_c_deci);
+        encode_i16_le(&payload[3], angle_a_deci);
+        encode_i16_le(&payload[5], distance_z_centi);
+        payload[7] = force_sync ? 0x01U : 0x00U;
+        (void)send_can_command(usb_dev, can_dev, node_id, payload, ARRAY_SIZE(payload));
+    }
     /* Movimento Normal com correção (M <node> <axis> <steps>) */
-    if ((cmd[0] == 'M' || cmd[0] == 'm') && cmd[1] == ' ' &&
-        sscanf(cmd, "%*c %u %c %d", &node_id, &axis, &steps) == 3) {
+    else if ((cmd[0] == 'M' || cmd[0] == 'm') && cmd[1] == ' ' &&
+         sscanf(cmd, "%*c %u %c %d", &node_id, &axis, &steps) == 3) {
         uint8_t payload[6];
         uint32_t encoded_steps = (uint32_t)steps;
         axis = can_axis_to_canonical(axis);

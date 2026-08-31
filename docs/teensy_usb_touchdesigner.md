@@ -37,7 +37,7 @@ Este documento descreve apenas o lado `TouchDesigner <-> USB`.
 ## Regras gerais do protocolo USB
 
 - `node_id` válido para unicast: `1..10`.
-- `node_id = 0` representa broadcast CAN e pode ser usado nos comandos de atuação `M`, `MF`, `H`, `E`, `S`, `L` e `F`.
+- `node_id = 0` representa broadcast CAN e pode ser usado nos comandos de atuação `M`, `MF`, `MS`, `MSF`, `H`, `E`, `S`, `L` e `F`.
 - `P` e `R` exigem um node de `1..10` para evitar respostas simultâneas de todos os nós.
 - O broadcast entrega um único frame a todos os ESP32, mas não garante que os motores iniciem no mesmo instante.
 - O bridge envia o DLC exato, sem byte de sequência. O firmware ESP32 atual não implementa correlação nem deduplicação por sequência.
@@ -98,6 +98,31 @@ Exemplo:
 
 ```text
 MF 2 A -200
+```
+
+---
+
+### 2.1. Mover C, A e Z sincronizados
+
+Sintaxe normal e forçada:
+
+```text
+MS <node_id> <graus_c> <graus_a> <mm_z>
+MSF <node_id> <graus_c> <graus_a> <mm_z>
+```
+
+- C/A são deslocamentos relativos com resolução CAN de `0,1°`.
+- Z é deslocamento relativo com resolução CAN de `0,01 mm`.
+- O Teensy monta um único frame CAN de opcode `0x23` e DLC 8.
+- O ESP32 converte as unidades físicas usando sua configuração e inicia os três canais RMT juntos.
+- `MSF` ignora encoder e limites angulares de C/A; as proteções físicas de Z continuam ativas.
+- Velocidade e aceleração vêm da configuração persistida no ESP32.
+
+Exemplos:
+
+```text
+MS 1 90.0 -45.0 10.00
+MSF 2 5.0 5.0 -2.50
 ```
 
 ---
@@ -506,6 +531,7 @@ TEENSY_ERROR UNKNOWN_COMMAND
 | `M` | Move | `0x20` |
 | `H` | Home | `0x21` |
 | `MF` | Move em malha aberta | `0x22` |
+| `MS` / `MSF` | Move C+A+Z sincronizado | `0x23` |
 | `L` | Laser | `0x30` |
 | `F` | Fan | `0x31` |
 
@@ -573,7 +599,7 @@ PONG 1 7 99
 - Enviar exatamente um comando por linha.
 - Fazer o parsing das respostas com `split()` por espaco.
 - Correlacionar respostas por `node_id`.
-- Para `MOVE`, `MF` e `HOME`, esperar primeiro `ACK` e depois `DONE` ou `ERROR`.
+- Para `MOVE`, `MF`, `MS`, `MSF` e `HOME`, esperar primeiro `ACK` e depois `DONE` ou `ERROR`.
 - Não manter vários comandos do mesmo opcode pendentes para o mesmo node: os eventos não carregam eixo nem sequência.
 - Após timeout, consultar `R` antes de repetir um movimento, evitando execução dupla.
 - Tratar `HEARTBEAT` como evento assincrono.

@@ -90,7 +90,7 @@ Todos os frames usam o formato padrão de 11 bits:
 
 O firmware ESP32-S3 atual **não implementa byte de sequência**. Ele não lê, armazena, devolve nem usa sequência para eliminar duplicatas. Alguns handlers toleram bytes excedentes, mas esses bytes não fazem parte do contrato e não devem ser enviados.
 
-O Teensy deve sempre transmitir o DLC exato indicado para cada opcode. Isso é especialmente importante no comando de laser, em que o quarto byte é a parte alta do nível, e no `MOVE_PROFILE`, que ocupa os 8 bytes do frame.
+O Teensy deve sempre transmitir o DLC exato indicado para cada opcode. Isso é especialmente importante no comando de laser, em que o quarto byte é a parte alta do nível, e em `MOVE_PROFILE`/`MOVE_SYNC`, que ocupam os 8 bytes do frame.
 
 Os eventos `ACK`, `DONE` e `ERROR` identificam somente o nó e o opcode. Portanto, não envie vários movimentos do mesmo opcode ao mesmo nó se for necessário correlacionar individualmente cada conclusão.
 
@@ -182,7 +182,7 @@ Mesmo formato de `CAN_OP_AXIS_SPEED`, com aceleração `float32` em `deg/s²` ou
 
 ### `0x14` — `CAN_OP_MOVE_PROFILE`
 
-Carrega um perfil de uso único para o próximo `MOVE`/`MOVE_FORCE` do mesmo eixo. Esse comando não grava NVS.
+Carrega um perfil de uso único para o próximo `MOVE`/`MOVE_FORCE` do mesmo eixo ou para o próximo `MOVE_SYNC`. Esse comando não grava NVS.
 
 **DLC esperado:** 8 bytes
 
@@ -236,6 +236,28 @@ O Teensy deve enviar o perfil imediatamente antes do movimento correspondente.
 Mesmo payload de `CAN_OP_MOVE`, mas executa em malha aberta, sem correção/limites dos encoders C/A. Os limites físicos do eixo Z continuam ativos.
 
 **DLC esperado:** 6 bytes
+
+---
+
+### `0x23` — `CAN_OP_MOVE_SYNC`
+
+Dispara um movimento relativo sincronizado de C, A e Z no próprio ESP32. O payload usa unidades físicas compactas e ocupa um único frame CAN Classic.
+
+**DLC esperado:** 8 bytes
+
+| Byte | Conteúdo |
+|------|----------|
+| 0 | Opcode (`0x23`) |
+| 1–2 | ΔC `int16` little-endian em décimos de grau (`0,1°`) |
+| 3–4 | ΔA `int16` little-endian em décimos de grau (`0,1°`) |
+| 5–6 | ΔZ `int16` little-endian em centésimos de milímetro (`0,01 mm`) |
+| 7 | Flags: bit 0 = forçar C/A sem encoder; bits 1–7 reservados e obrigatoriamente zero |
+
+O ESP32 converte as unidades físicas para passos usando `steps_per_rev`, microsteps e polia Z gravados localmente, enfileira um único `MOTION_CMD_MOVE_SYNC` e inicia os três canais RMT pelo mesmo planejador. A faixa representável é ±3276,7° para C/A e aproximadamente ±327,67 mm para Z.
+
+Perfis `CAN_OP_MOVE_PROFILE` opcionais podem ser enviados para C, A e Z imediatamente antes do trigger. As velocidades são consumidas por eixo; a aceleração compartilhada deve ser igual nos perfis usados. Sem perfil, o ESP32 usa a configuração persistida.
+
+**Resposta:** `CAN_EVT_ACK` quando o movimento sincronizado é enfileirado, seguido de `CAN_EVT_DONE` ou `CAN_EVT_ERROR` ao terminar.
 
 ---
 

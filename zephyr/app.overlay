@@ -1,6 +1,7 @@
 &flexcan1 {
     status = "okay";
     bus-speed = <500000>;
+    sample-point = <800>;
 };
 
 / {
