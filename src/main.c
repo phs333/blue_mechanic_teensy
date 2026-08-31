@@ -35,6 +35,15 @@
 #define CAN_NODE_ID_MIN     1U
 #define CAN_NODE_ID_MAX     10U
 
+/* Os filtros 0x7F0 reservam blocos de 16 IDs. Impedir que uma alteração
+ * futura no limite faça status, posição e eventos ocuparem a mesma faixa. */
+BUILD_ASSERT(CAN_NODE_ID_MAX <= 0x0FU,
+             "CAN node IDs must fit inside one 0x7F0 filter group");
+BUILD_ASSERT(CAN_STATUS_BASE_ID + CAN_NODE_ID_MAX < CAN_POS_BASE_ID,
+             "CAN status and position ID ranges overlap");
+BUILD_ASSERT(CAN_POS_BASE_ID + CAN_NODE_ID_MAX < CAN_EVENT_BASE_ID,
+             "CAN position and event ID ranges overlap");
+
 #define USB_CDC_NODE DT_NODELABEL(cdc_acm_uart0)
 #define CAN_PRIMARY_NODE DT_CHOSEN(zephyr_can_primary)
 
@@ -81,7 +90,7 @@ typedef struct {
 
 static rgb_color_t leds[NUM_LEDS];
 
-/* Estado de atividade dos nós (1 a 10) e barramentos */
+/* Estado de atividade dos nós e barramentos */
 typedef struct {
     uint32_t last_seen_ms;
     uint32_t cmd_flash_until_ms;
@@ -93,7 +102,7 @@ typedef struct {
     uint8_t node_id;
 } can_tx_result_t;
 
-static node_led_state_t node_states[11];
+static node_led_state_t node_states[CAN_NODE_ID_MAX + 1U];
 static uint32_t can_last_activity_ms = 0;
 static uint32_t can_flash_until_ms = 0;
 static uint32_t usb_last_activity_ms = 0;
@@ -106,6 +115,7 @@ CAN_DEFINE_MSGQ(can_rx_msgq, 32);
 K_MSGQ_DEFINE(can_tx_result_msgq, sizeof(can_tx_result_t), 8, 4);
 K_MUTEX_DEFINE(usb_tx_mutex);
 static atomic_t can_tx_pending;
+static atomic_t can_raw_trace_enabled;
 
 /* Pilhas de execução das threads secundárias */
 K_THREAD_STACK_DEFINE(can_rx_stack_area, 2048);
@@ -122,7 +132,7 @@ static const struct device *const can_primary_dev = DEVICE_DT_GET(CAN_PRIMARY_NO
 /* Notificações de Atividade para Animação dos LEDs                          */
 /* ========================================================================= */
 static void notify_node_activity(unsigned node_id) {
-    if (node_id >= 1 && node_id <= 10) {
+    if (node_id >= CAN_NODE_ID_MIN && node_id <= CAN_NODE_ID_MAX) {
         node_states[node_id].last_seen_ms = k_uptime_get_32();
     }
 }
@@ -136,7 +146,7 @@ static void notify_node_command(unsigned node_id) {
 
 static void notify_node_error(unsigned node_id) {
     uint32_t now = k_uptime_get_32();
-    if (node_id >= 1 && node_id <= 10) {
+    if (node_id >= CAN_NODE_ID_MIN && node_id <= CAN_NODE_ID_MAX) {
         node_states[node_id].error_flash_until_ms = now + 1500;
     }
 }
@@ -263,8 +273,8 @@ void led_strip_thread(void *p1, void *p2, void *p3) {
         /* ----------------------------------------------------------------- */
         /* LEDs 2 a 11: Status dos 10 Nós (Node 1 a Node 10)                 */
         /* ----------------------------------------------------------------- */
-        for (int node = 1; node <= 10; node++) {
-            int led_idx = node + 1; /* LED 2 = Node 1, ..., LED 11 = Node 10 */
+        for (unsigned node = CAN_NODE_ID_MIN; node <= CAN_NODE_ID_MAX; node++) {
+            unsigned led_idx = node + 1U; /* LED 2 = Node 1, ..., LED 11 = Node 10 */
 
             if (deadline_is_pending(now, node_states[node].error_flash_until_ms)) {
                 /* ERRO: Vermelho piscante rápido */
@@ -404,6 +414,41 @@ static void encode_i16_le(uint8_t *dest, int16_t value) {
     uint16_t raw = (uint16_t)value;
     dest[0] = (uint8_t)(raw & 0xFFU);
     dest[1] = (uint8_t)((raw >> 8) & 0xFFU);
+}
+
+static void write_can_raw_frame(const struct device *usb_dev,
+                                const struct zcan_frame *frame) {
+    char reply_buf[80];
+    size_t used;
+
+    if (usb_dev == NULL || frame == NULL) {
+        return;
+    }
+
+    used = (size_t)snprintf(reply_buf, sizeof(reply_buf),
+                            "CAN_RAW %03lX %u", (unsigned long)frame->id,
+                            frame->dlc);
+    for (uint8_t index = 0U;
+         index < frame->dlc && index < CAN_MAX_DLC && used < sizeof(reply_buf);
+         index++) {
+        int written = snprintf(&reply_buf[used], sizeof(reply_buf) - used,
+                               " %02X", frame->data[index]);
+        if (written < 0 || (size_t)written >= sizeof(reply_buf) - used) {
+            used = sizeof(reply_buf) - 1U;
+            break;
+        }
+        used += (size_t)written;
+    }
+    if (used < sizeof(reply_buf) - 2U) {
+        reply_buf[used++] = '\r';
+        reply_buf[used++] = '\n';
+        reply_buf[used] = '\0';
+    } else {
+        reply_buf[sizeof(reply_buf) - 3U] = '\r';
+        reply_buf[sizeof(reply_buf) - 2U] = '\n';
+        reply_buf[sizeof(reply_buf) - 1U] = '\0';
+    }
+    write_usb_serial(usb_dev, reply_buf);
 }
 
 /* Executado pelo driver FlexCAN em contexto de interrupção. Manter apenas
@@ -647,6 +692,19 @@ static void process_usb_command(const struct device *usb_dev,
             write_usb_serial(usb_dev, "TEENSY_ERROR UNKNOWN_COMMAND\r\n");
         }
     }
+    /* Diagnóstico dos frames CAN crus (RAW <0|1>) */
+    else if ((strncmp(cmd, "RAW ", 4) == 0 ||
+              strncmp(cmd, "raw ", 4) == 0) &&
+             sscanf(cmd, "%*s %u", &arg1) == 1) {
+        if (arg1 > 1U) {
+            write_invalid_argument(usb_dev, "CAN_RAW");
+            return;
+        }
+        atomic_set(&can_raw_trace_enabled, (atomic_val_t)arg1);
+        write_usb_serial(usb_dev, arg1 != 0U ?
+                         "TEENSY_OK CAN_RAW 1\r\n" :
+                         "TEENSY_OK CAN_RAW 0\r\n");
+    }
     /* Solicitação de Status (R <node>) */
     else if ((cmd[0] == 'R' || cmd[0] == 'r') && sscanf(cmd, "%*c %u", &node_id) == 1) {
         const uint8_t payload[1] = {CAN_OP_STATUS_REQUEST};
@@ -676,6 +734,10 @@ void can_rx_thread(void *p1, void *p2, void *p3) {
 
     while (1) {
         k_msgq_get(&can_rx_msgq, &frame, K_FOREVER);
+
+        if (atomic_get(&can_raw_trace_enabled) != 0) {
+            write_can_raw_frame(usb_dev, &frame);
+        }
 
         if (frame.dlc > 0) {
             unsigned node_id;

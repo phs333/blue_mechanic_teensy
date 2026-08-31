@@ -65,6 +65,7 @@ flowchart LR
 | **Ventoinha (Cooler)** | `F <node> <modo>` | `<node>`: 0..10<br>`<modo>`: `0` (Off), `1` (On), `2` (Auto) | Define o modo de controle da ventoinha de resfriamento. | `F 0 2` *(modo térmico automático em todos)*<br>`F 1 1` *(força cooler ligado no node 1)* |
 | **Solicitação de Status** | `R <node>` | `<node>`: 1..10 *(não usar 0)* | Solicita o envio imediato dos frames de **Status** e **Posição** do nó. | `R 1` *(solicita status do node 1)* |
 | **Ping** | `P <node> [arg0] [arg1]` | `<node>`: 1..10<br>`arg0`, `arg1`: uint8 opcionais | Teste de conectividade. Quando omitidos, o Teensy envia ambos como zero. | `P 1 10 20` |
+| **Diagnóstico CAN cru** | `RAW <0\|1>` | `1`: habilita<br>`0`: desabilita | Emite `CAN_RAW` antes de cada resposta decodificada, sem alterar `STATUS`, `POS` ou eventos. Desligado após cada reset. | `RAW 1` |
 
 ---
 
@@ -124,6 +125,13 @@ STATUS <node_id> <flags> <laser1_pwm> <laser2_pwm> <fan_on> <fan_mode> <speed_lv
 | **`TEENSY_ERROR <motivo>`** | Erro de sintaxe ou falha de transmissão na ponte USB/CAN do Teensy. | `TEENSY_ERROR INVALID_NODE_ID 99` |
 
 `opcode` e `err` são impressos com dois dígitos hexadecimais, sem prefixo `0x`. O protocolo CAN atual não possui sequência; por isso, o host não deve manter vários movimentos do mesmo opcode pendentes para o mesmo nó. Um movimento aceito também pode ser removido da fila pelo firmware quando um novo movimento oposto substitui comandos pendentes. Nessa situação, não há `DONE` para o item removido.
+
+Com o diagnóstico habilitado, cada frame recebido também gera uma linha com o
+ID, DLC e bytes exatamente como chegaram do driver FlexCAN:
+
+```text
+CAN_RAW 291 8 D2 04 7B 00 00 00 FA 00
+```
 
 ---
 

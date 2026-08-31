@@ -301,6 +301,21 @@ STATUS <node_id> <flags> <laser1> <laser2> <fan_on> <fan_mode> <speed>
 POS <node_id> <pos_c> <pos_a> <z_steps> <temp_c>
 ```
 
+Para diagnosticar o payload sem mudar as respostas usadas pelo app, habilite
+temporariamente o espelho dos frames crus:
+
+```text
+RAW 1
+R 1
+RAW 0
+```
+
+Enquanto ativo, o Teensy emite antes da linha decodificada:
+
+```text
+CAN_RAW 291 8 D2 04 7B 00 00 00 FA 00
+```
+
 ---
 
 ## Respostas enviadas pelo Teensy ao TouchDesigner

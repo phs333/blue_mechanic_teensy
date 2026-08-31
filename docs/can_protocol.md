@@ -4,7 +4,7 @@
 
 A comunicação CAN utiliza o periférico TWAI on-chip do ESP32-S3. O Teensy 4.1 com Zephyr atua como bridge/controlador da aplicação e os ESP32-S3 atuam como nós de execução. Fisicamente, a topologia é um barramento multidrop com 1 Teensy e até 10 ESP32-S3.
 
-Embora o firmware ESP32 aceite `node_id` de 1 a 127, o contrato do sistema Blue Mechanic limita os IDs a **1–10**. Esse limite mantém as faixas padrão de status e posição sem sobreposição e corresponde aos filtros do Teensy.
+O `node_id` válido é **1–10** tanto no ESP32 quanto no Teensy. O limite faz parte do protocolo: com as bases padrão e filtros `0x7F0`, valores maiores podem fazer status, posição e eventos compartilharem o mesmo CAN ID.
 
 O protocolo usa frames CAN padrão de 11 bits (standard identifiers) com DLC máximo de 8 bytes.
 
@@ -424,12 +424,12 @@ O ESP32 valida as configurações CAN antes de iniciar o periférico TWAI:
 
 | Parâmetro     | Restrição                          |
 |---------------|------------------------------------|
-| `node_id`     | 1–127                              |
+| `node_id`     | 1–10                               |
 | `can_bitrate` | 125000, 250000, 500000, 1000000   |
-| `can_command_base_id + 127` | ≤ `0x7FF` (limite de 11 bits) |
-| `can_status_base_id + 127`  | ≤ `0x7FF`                       |
-| `can_status_base_id + 0x10 + 127` | ≤ `0x7FF`                 |
-| `can_event_base_id + 127`   | ≤ `0x7FF`                       |
+| `can_command_base_id + 10` | ≤ `0x7FF` (limite de 11 bits) |
+| `can_status_base_id + 10`  | ≤ `0x7FF`                       |
+| `can_status_base_id + 0x10 + 10` | ≤ `0x7FF`                 |
+| `can_event_base_id + 10`   | ≤ `0x7FF`                       |
 
 Se a configuração for inválida, o ESP32 não inicia o TWAI e reporta `ESP_ERR_INVALID_ARG`.
 
