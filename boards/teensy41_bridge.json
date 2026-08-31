@@ -1,0 +1,45 @@
+{
+  "build": {
+    "arduino": {
+      "ldscript": "imxrt1062_t41.ld"
+    },
+    "core": "teensy4",
+    "cpu": "cortex-m7",
+    "extra_flags": "-D__IMXRT1062__ -DARDUINO_TEENSY41",
+    "f_cpu": "600000000",
+    "hwids": [
+      [
+        "0x1209",
+        "0x0001"
+      ]
+    ],
+    "mcu": "imxrt1062",
+    "zephyr": {
+      "variant": "teensy41"
+    }
+  },
+  "connectivity": [
+    "can"
+  ],
+  "debug": {
+    "jlink_device": "MIMXRT1062xxxxA"
+  },
+  "frameworks": [
+    "arduino",
+    "zephyr"
+  ],
+  "name": "Teensy 4.1 - Blue Mechanic CAN USB Bridge",
+  "upload": {
+    "maximum_ram_size": 524288,
+    "maximum_size": 8126464,
+    "protocol": "custom",
+    "protocols": [
+      "custom",
+      "teensy-cli",
+      "teensy-gui",
+      "jlink"
+    ]
+  },
+  "url": "https://www.pjrc.com/store/teensy41.html",
+  "vendor": "Blue Mechanic"
+}

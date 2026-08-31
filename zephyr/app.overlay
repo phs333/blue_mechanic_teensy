@@ -1,0 +1,21 @@
+&flexcan1 {
+    status = "okay";
+    bus-speed = <500000>;
+};
+
+/ {
+    chosen {
+        zephyr,can-primary = &flexcan1;
+    };
+};
+
+&zephyr_udc0 {
+    status = "okay";
+    maximum-speed = "high-speed";
+
+    cdc_acm_uart0: cdc_acm_uart0 {
+        compatible = "zephyr,cdc-acm-uart";
+        label = "CDC_ACM_0";
+        status = "okay";
+    };
+};
