@@ -12,7 +12,7 @@ O bridge usa uma identidade USB estável:
 | Campo | Valor de desenvolvimento |
 |---|---|
 | VID:PID | `1209:0001` |
-| Produto | `Blue Mechanic CAN USB Bridge` |
+| Produto | `Azul Mecanico USB` |
 | Serial | hexadecimal único do i.MX RT1062, por exemplo `5001008B403151D700` |
 
 `1209:0001` é o PID público de teste do projeto pid.codes. Ele é adequado
@@ -87,7 +87,8 @@ porta antes do primeiro envio.
 ## Diagnóstico rápido
 
 1. Confirme que o cabo USB transmite dados, não apenas alimentação.
-2. No Gerenciador de Dispositivos, procure `Blue Mechanic CAN USB Bridge` em
+2. No Gerenciador de Dispositivos, procure `Azul Mecanico USB` (ou `Dispositivo serial USB`
+   caso o driver ainda não tenha sido instalado via `tools/install_driver.bat`) em
    **Portas (COM e LPT)**.
 3. Execute `pio device list` e confira `VID:PID=1209:0001` e o serial.
 4. Se o Teensy estiver no bootloader, ele aparece como o dispositivo de carga

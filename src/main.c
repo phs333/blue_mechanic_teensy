@@ -61,6 +61,10 @@ BUILD_ASSERT(CAN_POS_BASE_ID + CAN_NODE_ID_MAX < CAN_EVENT_BASE_ID,
 #define CAN_OP_MOVE_SYNC      0x23U
 #define CAN_OP_LASER          0x30U
 #define CAN_OP_FAN            0x31U
+#define CAN_OP_OTA_START      0x40U
+#define CAN_OP_OTA_DATA       0x41U
+#define CAN_OP_OTA_END        0x42U
+#define CAN_OP_OTA_ABORT      0x43U
 
 /* Eventos CAN (Slaves -> Master) */
 #define CAN_EVT_HEARTBEAT     0x80U
@@ -68,6 +72,10 @@ BUILD_ASSERT(CAN_POS_BASE_ID + CAN_NODE_ID_MAX < CAN_EVENT_BASE_ID,
 #define CAN_EVT_STATUS        0x82U
 #define CAN_EVT_ACK           0x83U
 #define CAN_EVT_DONE          0x84U
+#define CAN_EVT_OTA_READY     0x90U
+#define CAN_EVT_OTA_PROGRESS  0x91U
+#define CAN_EVT_OTA_DONE      0x92U
+#define CAN_EVT_OTA_ERROR     0x93U
 #define CAN_EVT_ERROR         0xE0U
 
 /* ========================================================================= */
@@ -95,6 +103,7 @@ typedef struct {
     uint32_t last_seen_ms;
     uint32_t cmd_flash_until_ms;
     uint32_t error_flash_until_ms;
+    uint32_t ota_flash_until_ms;
 } node_led_state_t;
 
 typedef struct {
@@ -148,6 +157,19 @@ static void notify_node_error(unsigned node_id) {
     uint32_t now = k_uptime_get_32();
     if (node_id >= CAN_NODE_ID_MIN && node_id <= CAN_NODE_ID_MAX) {
         node_states[node_id].error_flash_until_ms = now + 1500;
+    }
+}
+
+static void notify_node_ota(unsigned node_id) {
+    uint32_t now = k_uptime_get_32();
+    if (node_id >= CAN_NODE_ID_MIN && node_id <= CAN_NODE_ID_MAX) {
+        node_states[node_id].last_seen_ms = now;
+        node_states[node_id].ota_flash_until_ms = now + 4000;
+    } else if (node_id == 0U) {
+        for (unsigned i = CAN_NODE_ID_MIN; i <= CAN_NODE_ID_MAX; i++) {
+            node_states[i].last_seen_ms = now;
+            node_states[i].ota_flash_until_ms = now + 4000;
+        }
     }
 }
 
@@ -279,6 +301,9 @@ void led_strip_thread(void *p1, void *p2, void *p3) {
             if (deadline_is_pending(now, node_states[node].error_flash_until_ms)) {
                 /* ERRO: Vermelho piscante rápido */
                 leds[led_idx] = (tick % 4 < 2) ? (rgb_color_t){255, 0, 0} : (rgb_color_t){40, 0, 0};
+            } else if (deadline_is_pending(now, node_states[node].ota_flash_until_ms)) {
+                /* ATUALIZAÇÃO OTA: Ciano pulsante rápido (~4 Hz) */
+                leds[led_idx] = (tick % 6 < 3) ? (rgb_color_t){0, 180, 240} : (rgb_color_t){0, 25, 45};
             } else if (deadline_is_pending(now, node_states[node].cmd_flash_until_ms)) {
                 /* COMANDO OK: Piscada rápida Azul */
                 leds[led_idx] = (rgb_color_t){0, 60, 255};
@@ -481,6 +506,30 @@ static void report_can_tx_results(const struct device *usb_dev) {
     }
 }
 
+static int hex_char_to_val(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int hex_string_to_bytes(const char *hex_str, uint8_t *dest, size_t max_bytes) {
+    size_t len = strlen(hex_str);
+    if (len == 0 || (len % 2) != 0 || (len / 2) > max_bytes) {
+        return -1;
+    }
+    size_t byte_count = len / 2;
+    for (size_t i = 0; i < byte_count; i++) {
+        int high = hex_char_to_val(hex_str[i * 2]);
+        int low = hex_char_to_val(hex_str[i * 2 + 1]);
+        if (high < 0 || low < 0) {
+            return -1;
+        }
+        dest[i] = (uint8_t)((high << 4) | low);
+    }
+    return (int)byte_count;
+}
+
 static int send_can_command(const struct device *usb_dev,
                             const struct device *can_dev, unsigned node_id,
                             const uint8_t *payload, size_t payload_len) {
@@ -510,8 +559,18 @@ static int send_can_command(const struct device *usb_dev,
     /* can_send() síncrono no driver FlexCAN do Zephyr 2.7 espera K_FOREVER
      * pela conclusão. Sem transceiver ou ACK isso congelava também a USB.
      * Manter um único envio assíncrono pendente evita bloquear o protocolo e
-     * impede esgotar mailboxes se o hardware CAN estiver desconectado. */
-    if (!atomic_cas(&can_tx_pending, 0, 1)) {
+     * impede esgotar mailboxes se o hardware CAN estiver desconectado.
+     * Durante streaming de blocos OTA, permite até 1ms de micro-retry para
+     * que a conclusão do frame anterior libere o TX sem gerar erro falso de BUSY. */
+    bool acquired = false;
+    for (int retry = 0; retry < 10; retry++) {
+        if (atomic_cas(&can_tx_pending, 0, 1)) {
+            acquired = true;
+            break;
+        }
+        k_busy_wait(100);
+    }
+    if (!acquired) {
         snprintf(reply_buf, sizeof(reply_buf),
                  "TEENSY_ERROR CAN_TX_BUSY %u\r\n", node_id);
         write_usb_serial(usb_dev, reply_buf);
@@ -717,6 +776,112 @@ static void process_usb_command(const struct device *usb_dev,
         }
         (void)send_can_command(usb_dev, can_dev, node_id, payload, ARRAY_SIZE(payload));
     }
+    /* Comandos de Atualização OTA via CAN (OTA_START, OTA_DATA, OTA_END, OTA_ABORT) */
+    else if ((strncmp(cmd, "OTA_START ", 10) == 0 || strncmp(cmd, "ota_start ", 10) == 0 ||
+              strncmp(cmd, "OTA START ", 10) == 0 || strncmp(cmd, "ota start ", 10) == 0)) {
+        const char *p = cmd + 10;
+        uint32_t img_size = 0;
+        if (sscanf(p, "%u %u", &node_id, &img_size) == 2) {
+            if (!can_node_id_is_valid(node_id)) {
+                write_invalid_argument(usb_dev, "NODE_ID");
+                return;
+            }
+            uint8_t payload[7] = {
+                CAN_OP_OTA_START,
+                (uint8_t)node_id,
+                (uint8_t)(img_size & 0xFFU),
+                (uint8_t)((img_size >> 8) & 0xFFU),
+                (uint8_t)((img_size >> 16) & 0xFFU),
+                (uint8_t)((img_size >> 24) & 0xFFU),
+                0x00U /* flags */
+            };
+            int err = send_can_command(usb_dev, can_dev, node_id, payload, sizeof(payload));
+            if (err == 0) {
+                notify_node_ota(node_id);
+                char reply_buf[64];
+                snprintf(reply_buf, sizeof(reply_buf), "TEENSY_OK OTA_START %u\r\n", node_id);
+                write_usb_serial(usb_dev, reply_buf);
+            }
+        } else {
+            write_invalid_argument(usb_dev, "OTA_START");
+        }
+    }
+    else if ((strncmp(cmd, "OTA_DATA ", 9) == 0 || strncmp(cmd, "ota_data ", 9) == 0 ||
+              strncmp(cmd, "OTA DATA ", 9) == 0 || strncmp(cmd, "ota data ", 9) == 0)) {
+        const char *p = cmd + 9;
+        unsigned seq_num = 0;
+        char hex_buf[32] = {0};
+        if (sscanf(p, "%u %u %31s", &node_id, &seq_num, hex_buf) == 3) {
+            if (!can_node_id_is_valid(node_id) || seq_num > 255U) {
+                write_invalid_argument(usb_dev, "OTA_DATA");
+                return;
+            }
+            uint8_t chunk_data[6];
+            int chunk_len = hex_string_to_bytes(hex_buf, chunk_data, sizeof(chunk_data));
+            if (chunk_len <= 0) {
+                write_invalid_argument(usb_dev, "OTA_HEX");
+                return;
+            }
+            uint8_t payload[8];
+            payload[0] = CAN_OP_OTA_DATA;
+            payload[1] = (uint8_t)seq_num;
+            memcpy(&payload[2], chunk_data, (size_t)chunk_len);
+            int err = send_can_command(usb_dev, can_dev, node_id, payload, (size_t)(chunk_len + 2));
+            if (err == 0) {
+                notify_node_ota(node_id);
+            }
+        } else {
+            write_invalid_argument(usb_dev, "OTA_DATA");
+        }
+    }
+    else if ((strncmp(cmd, "OTA_END ", 8) == 0 || strncmp(cmd, "ota_end ", 8) == 0 ||
+              strncmp(cmd, "OTA END ", 8) == 0 || strncmp(cmd, "ota end ", 8) == 0)) {
+        const char *p = cmd + 8;
+        unsigned checksum = 0;
+        int parsed = sscanf(p, "%u %u", &node_id, &checksum);
+        if (parsed >= 1) {
+            if (!can_node_id_is_valid(node_id)) {
+                write_invalid_argument(usb_dev, "NODE_ID");
+                return;
+            }
+            uint8_t payload[4] = {
+                CAN_OP_OTA_END,
+                (uint8_t)node_id,
+                (uint8_t)(checksum & 0xFFU),
+                (uint8_t)((checksum >> 8) & 0xFFU)
+            };
+            int err = send_can_command(usb_dev, can_dev, node_id, payload, sizeof(payload));
+            if (err == 0) {
+                notify_node_ota(node_id);
+                char reply_buf[64];
+                snprintf(reply_buf, sizeof(reply_buf), "TEENSY_OK OTA_END %u\r\n", node_id);
+                write_usb_serial(usb_dev, reply_buf);
+            }
+        } else {
+            write_invalid_argument(usb_dev, "OTA_END");
+        }
+    }
+    else if ((strncmp(cmd, "OTA_ABORT", 9) == 0 || strncmp(cmd, "ota_abort", 9) == 0 ||
+              strncmp(cmd, "OTA ABORT", 9) == 0 || strncmp(cmd, "ota abort", 9) == 0)) {
+        const char *p = (cmd[3] == '_') ? (cmd + 9) : (cmd + 9);
+        node_id = 0;
+        (void)sscanf(p, "%u", &node_id);
+        if (!can_node_id_is_valid(node_id)) {
+            write_invalid_argument(usb_dev, "NODE_ID");
+            return;
+        }
+        uint8_t payload[2] = {
+            CAN_OP_OTA_ABORT,
+            (uint8_t)node_id
+        };
+        int err = send_can_command(usb_dev, can_dev, node_id, payload, sizeof(payload));
+        if (err == 0) {
+            notify_node_activity(node_id);
+            char reply_buf[64];
+            snprintf(reply_buf, sizeof(reply_buf), "TEENSY_OK OTA_ABORT %u\r\n", node_id);
+            write_usb_serial(usb_dev, reply_buf);
+        }
+    }
     else {
         write_usb_serial(usb_dev, "TEENSY_ERROR UNKNOWN_COMMAND\r\n");
     }
@@ -816,6 +981,38 @@ void can_rx_thread(void *p1, void *p2, void *p3) {
                 notify_node_activity(node_id);
                 write_usb_serial(usb_dev, reply_buf);
                 notify_node_command(node_id);
+            } else if (can_id_to_node(frame.id, CAN_EVENT_BASE_ID, &node_id) &&
+                       op == CAN_EVT_OTA_READY && frame.dlc >= 3) {
+                uint8_t status = (frame.dlc >= 4) ? frame.data[3] : 0;
+                snprintf(reply_buf, sizeof(reply_buf), "OTA_READY %u %u\r\n", node_id, status);
+                notify_can_activity();
+                notify_node_activity(node_id);
+                notify_node_command(node_id);
+                notify_node_ota(node_id);
+                write_usb_serial(usb_dev, reply_buf);
+            } else if (can_id_to_node(frame.id, CAN_EVENT_BASE_ID, &node_id) &&
+                       op == CAN_EVT_OTA_PROGRESS && frame.dlc >= 3) {
+                uint8_t pct = (frame.dlc >= 4) ? frame.data[3] : 0;
+                snprintf(reply_buf, sizeof(reply_buf), "OTA_PROGRESS %u %u\r\n", node_id, pct);
+                notify_can_activity();
+                notify_node_activity(node_id);
+                notify_node_ota(node_id);
+                write_usb_serial(usb_dev, reply_buf);
+            } else if (can_id_to_node(frame.id, CAN_EVENT_BASE_ID, &node_id) &&
+                       op == CAN_EVT_OTA_DONE && frame.dlc >= 2) {
+                snprintf(reply_buf, sizeof(reply_buf), "OTA_DONE %u\r\n", node_id);
+                notify_can_activity();
+                notify_node_activity(node_id);
+                notify_node_command(node_id);
+                write_usb_serial(usb_dev, reply_buf);
+            } else if (can_id_to_node(frame.id, CAN_EVENT_BASE_ID, &node_id) &&
+                       op == CAN_EVT_OTA_ERROR && frame.dlc >= 3) {
+                uint8_t err_code = (frame.dlc >= 4) ? frame.data[3] : 0xFF;
+                snprintf(reply_buf, sizeof(reply_buf), "OTA_ERROR %u %u\r\n", node_id, err_code);
+                notify_can_activity();
+                notify_node_activity(node_id);
+                notify_node_error(node_id);
+                write_usb_serial(usb_dev, reply_buf);
             } else if (can_id_to_node(frame.id, CAN_EVENT_BASE_ID, &node_id) &&
                        op == CAN_EVT_ERROR && frame.dlc >= 4) {
                 snprintf(reply_buf, sizeof(reply_buf), "ERROR %u %02X %02X\r\n",
@@ -948,7 +1145,9 @@ void main(void) {
         usb_was_open = usb_is_open;
 
         uint8_t c;
-        if (uart_poll_in(usb_dev, &c) == 0) {
+        int rx_count = 0;
+        while (rx_count < 64 && uart_poll_in(usb_dev, &c) == 0) {
+            rx_count++;
             if (c == '\n' || c == '\r') {
                 if (usb_rx_overflow) {
                     write_usb_serial(usb_dev,
@@ -968,7 +1167,8 @@ void main(void) {
                     usb_rx_idx = 0;
                 }
             }
-        } else {
+        }
+        if (rx_count == 0) {
             k_msleep(1);
         }
     }

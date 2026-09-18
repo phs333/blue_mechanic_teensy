@@ -1,0 +1,38 @@
+; azul_mecanico.inf
+; Instalador de nome de porta COM para o Azul Mecanico (Teensy 4.1 CAN Bridge)
+; Vincula o dispositivo ao driver oficial da Microsoft (usbser.sys) com nome personalizado.
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = Ports
+ClassGuid   = {4d36e978-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+DriverVer   = 09/18/2026,1.0.0.0
+PnpLockdown = 1
+
+[Manufacturer]
+%ManufacturerName% = DeviceList, NTamd64, NTarm64, NTx86
+
+[DeviceList.NTamd64]
+%DeviceDesc% = UsbSerialInstall, USB\VID_1209&PID_0001&MI_00
+%DeviceDesc% = UsbSerialInstall, USB\VID_1209&PID_0001
+
+[DeviceList.NTarm64]
+%DeviceDesc% = UsbSerialInstall, USB\VID_1209&PID_0001&MI_00
+%DeviceDesc% = UsbSerialInstall, USB\VID_1209&PID_0001
+
+[DeviceList.NTx86]
+%DeviceDesc% = UsbSerialInstall, USB\VID_1209&PID_0001&MI_00
+%DeviceDesc% = UsbSerialInstall, USB\VID_1209&PID_0001
+
+[UsbSerialInstall]
+Include = usbser.inf
+Needs   = UsbSerial_Install
+
+[UsbSerialInstall.Services]
+Include = usbser.inf
+Needs   = UsbSerial_Install.Services
+
+[Strings]
+ManufacturerName = "PHS"
+DeviceDesc       = "Azul Mecanico USB"
