@@ -64,6 +64,7 @@ flowchart LR
 | **Laser PWM (12-bit)** | `L <node> <laser> <pwm>` | `<node>`: 0..10<br>`<laser>`: `1` ou `2`<br>`<pwm>`: `0` a `4095` | Ajusta a intensidade do canal de laser especificado (`0` = 0%, `4095` = 100%). | `L 0 1 4095` *(laser 1 em 100% em todos)*<br>`L 1 2 2048` *(laser 2 em 50% no node 1)*<br>`L 0 1 0` *(apaga laser 1 em todos)* |
 | **Ventoinha (Cooler)** | `F <node> <modo>` | `<node>`: 0..10<br>`<modo>`: `0` (Off), `1` (On), `2` (Auto) | Define o modo de controle da ventoinha de resfriamento. | `F 0 2` *(modo térmico automático em todos)*<br>`F 1 1` *(força cooler ligado no node 1)* |
 | **Solicitação de Status** | `R <node>` | `<node>`: 1..10 *(não usar 0)* | Solicita o envio imediato dos frames de **Status** e **Posição** do nó. | `R 1` *(solicita status do node 1)* |
+| **Parada imediata** | `X <node> [flags]`<br>`STOP <node>`<br>`ESTOP <node>` | `<node>`: 0..10 (0 = todos)<br>`flags`: bit 0 = apagar lasers | Interrompe o movimento em curso e esvazia a fila (opcode CAN `0x24`). `ESTOP` = `X <node> 1` (também apaga os lasers). Tem prioridade de TX sobre os demais comandos. Responde `TEENSY_OK STOP <node> <flags>`. | `ESTOP 0`<br>`X 3` |
 | **Ping** | `P <node> [arg0] [arg1]` | `<node>`: 1..10<br>`arg0`, `arg1`: uint8 opcionais | Teste de conectividade. Quando omitidos, o Teensy envia ambos como zero. | `P 1 10 20` |
 | **Diagnóstico CAN cru** | `RAW <0\|1>` | `1`: habilita<br>`0`: desabilita | Emite `CAN_RAW` antes de cada resposta decodificada, sem alterar `STATUS`, `POS` ou eventos. Desligado após cada reset. | `RAW 1` |
 
@@ -78,8 +79,9 @@ Emitido logo após `STATUS` quando o ESP32 responde a uma solicitação de statu
 ```
 POS <node_id> <pos_c_deg> <pos_a_deg> <pos_z_steps> <temp_c>
 ```
-* `<pos_c_deg>`: Posição angular real do Eixo C em Graus com 2 casas decimais (ex: `120.45`). Se inválido: `-1.00`.
-* `<pos_a_deg>`: Posição angular real do Eixo A em Graus com 2 casas decimais (ex: `89.90`). Se inválido: `-1.00`.
+* `<pos_c_deg>`: Posição angular do Eixo C em graus, **com sinal** (ex: `-45.3`, `540.0`). Se inválido: `nan`.
+* `<pos_a_deg>`: Posição angular do Eixo A em graus, com sinal. Se inválido: `nan`.
+* Nós com firmware novo enviam décimos de grau com sinal (formato v2, indicado no `STATUS`); nós antigos continuam em 0..360 com 2 casas. Antes, `-1.00` indicava inválido — com ângulos negativos isso seria ambíguo.
 * `<pos_z_steps>`: Posição linear atual do Eixo Z em passos (ex: `1500`).
 * `<temp_c>`: Temperatura da placa em Graus Celsius com 1 casa decimal (ex: `28.5`).
 * **Exemplo de linha recebida:**

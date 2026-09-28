@@ -261,6 +261,21 @@ Perfis `CAN_OP_MOVE_PROFILE` opcionais podem ser enviados para C, A e Z imediata
 
 ---
 
+### `0x24` — `CAN_OP_STOP`
+
+Parada imediata. Interrompe o movimento em curso (RMT ou bit-bang, latência ≤ 5 ms), descarta todos os comandos na fila e é aceito em qualquer estado, inclusive durante OTA. Envie no ID de broadcast para parar todos os nós.
+
+**DLC esperado:** 2 bytes
+
+| Byte | Conteúdo |
+|------|----------|
+| 0 | Opcode (`0x24`) |
+| 1 | Flags: bit 0 = também apagar os dois lasers (E-STOP); bits 1–7 reservados |
+
+**Resposta:** `CAN_EVT_ACK`. O movimento interrompido termina com `CAN_EVT_ERROR` (`0x0C`, `ESP_ERR_NOT_FINISHED`), e cada comando descartado da fila também recebe `CAN_EVT_ERROR` com `0x0C`. Se o STOP interromper um `MOVE_SYNC` com Z, a posição Z fica incerta e é preciso `HOME Z`.
+
+---
+
 ### `0x30` — `CAN_OP_LASER`
 
 **DLC esperado:** 4 bytes no formato atual de 16 bits. O ESP32 ainda aceita o formato legado de 3 bytes.
@@ -350,13 +365,14 @@ Resposta ao `CAN_OP_STATUS_REQUEST`. Payload de 8 bytes.
 | 3   | `0x08`   | `temp_valid`                   |
 | 4   | `0x10`   | `tmc_uart_ready`               |
 | 5   | `0x20`   | `can_online`                   |
+| 6   | `0x40`   | `pos_v2`: o frame de posição seguinte usa o formato v2 (ângulos com sinal) |
 
 ### Telemetria de posição e temperatura (`own_position_id`)
 
 | Byte | Conteúdo |
 |------|----------|
-| 0–1 | C em centigraus, `uint16` little-endian (`0xFFFF` = inválido) |
-| 2–3 | A em centigraus, `uint16` little-endian (`0xFFFF` = inválido) |
+| 0–1 | C: v2 = décimos de grau, `int16` com sinal (`INT16_MIN` = inválido); v1 = centigraus `uint16` 0..36000 (`0xFFFF` = inválido) |
+| 2–3 | A: mesmo formato de C |
 | 4–5 | Z em passos, `uint16` little-endian (saturado em `65534`) |
 | 6–7 | Temperatura em décimos de °C, `int16` little-endian (`INT16_MIN` = inválida) |
 

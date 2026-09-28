@@ -491,7 +491,8 @@ Exemplo:
 POS 1 12.34 98.70 2048 26.5
 ```
 
-Posicoes invalidas aparecem como `-1.00`; temperatura invalida aparece como
+Posicoes podem ser negativas (limites de +-540 graus) e posicoes invalidas
+aparecem como `nan`; temperatura invalida aparece como
 `-99.9`. A formatacao e feita com inteiros no firmware e nao depende de
 suporte a `printf` de ponto flutuante.
 
