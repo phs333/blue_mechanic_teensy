@@ -1209,6 +1209,10 @@ void main(void) {
         report_can_tx_results(usb_dev);
 
         if (usb_is_open && !usb_was_open) {
+            /* Nova sessão: descarta linha parcial/estouro da sessão anterior. Sem isso o
+             * primeiro comando do host era engolido como LINE_TOO_LONG. */
+            usb_rx_idx = 0U;
+            usb_rx_overflow = false;
             write_usb_serial(usb_dev, "TEENSY_READY 1\r\n");
             if (!can_filters_ready) {
                 char filter_error[96];
