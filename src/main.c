@@ -55,12 +55,17 @@ BUILD_ASSERT(CAN_POS_BASE_ID + CAN_NODE_ID_MAX < CAN_EVENT_BASE_ID,
 #define CAN_OP_AXIS_SPEED     0x12U
 #define CAN_OP_AXIS_ACCEL     0x13U
 #define CAN_OP_MOVE_PROFILE   0x14U
+#define CAN_OP_SET_BITRATE    0x15U /* [0x15, b0..b3]: nodes respondem ACK e trocam ~30 ms depois */
 #define CAN_OP_MOVE           0x20U
 #define CAN_OP_HOME           0x21U
 #define CAN_OP_MOVE_FORCE     0x22U
 #define CAN_OP_MOVE_SYNC      0x23U
 #define CAN_OP_STOP           0x24U /* [0x24, flags]; bit0 = apagar lasers (E-STOP) */
 #define CAN_OP_MOVE_UNIFIED   0x25U /* Movimento unificado 3 eixos absolutos */
+#define CAN_OP_SYNC_COMMIT    0x26U /* Broadcast: nodes aplicam juntos os U marcados (byte 7 bit 7) */
+#define CAN_UNIFIED_LATCH_FLAG 0x80U
+/* Z nos frames 0x23/0x25: int16 em unidades de 0,02 mm (0..480 mm cabe; limite +-655,34 mm) */
+#define CAN_Z_UNITS_PER_MM    50.0f
 #define CAN_OP_LASER          0x30U
 #define CAN_OP_FAN            0x31U
 #define CAN_OP_LASER_DUAL     0x32U /* Controle simultâneo dos 2 lasers: [0x32, L1_lo, L1_hi, L2_lo, L2_hi] */
@@ -94,6 +99,20 @@ BUILD_ASSERT(CAN_POS_BASE_ID + CAN_NODE_ID_MAX < CAN_EVENT_BASE_ID,
 #define CAN_TX_BUSY_RETRIES_STOP    500
 #define CAN_TX_BUSY_RETRIES_CHAINED 500
 
+/* Frames CAN em voo ao mesmo tempo (mailboxes do FlexCAN). No maximo um por node, para
+ * preservar a ordem U -> laser -> U do mesmo node (mesmo ID: o FlexCAN desempata pelo
+ * numero do mailbox, nao pela ordem de envio). Nodes diferentes podem sair em qualquer
+ * ordem. Broadcast so sai com tudo vazio e segura os unicasts: o ID 0x200 vence a
+ * arbitragem e passaria na frente de frames mais antigos (um STOP antes de um U velho). */
+#define CAN_TX_MAX_IN_FLIGHT 4U
+
+/* Commit sincronizado do U: sem bytes novos na COM por este tempo, a rajada do TD acabou */
+#define USYNC_IDLE_US 300
+
+/* O cache de lasers só suprime frames repetidos dentro desta janela: um frame perdido,
+ * um reboot do nó ou um laser alterado por outro caminho se corrigem sozinhos. */
+#define LASER_CACHE_REFRESH_MS 250U
+
 /* ========================================================================= */
 /* Configuração da Fita de LED WS2812 (12 LEDs no Pino 14 do Teensy 4.1)     */
 /* ========================================================================= */
@@ -113,6 +132,7 @@ typedef struct {
 } rgb_color_t;
 
 static rgb_color_t leds[NUM_LEDS];
+static rgb_color_t leds_shown[NUM_LEDS];
 
 /* Estado de atividade dos nós e barramentos */
 typedef struct {
@@ -134,6 +154,7 @@ static atomic_t node_pos_v2[CAN_NODE_ID_MAX + 1U];
 static uint16_t node_last_laser1[CAN_NODE_ID_MAX + 1U];
 static uint16_t node_last_laser2[CAN_NODE_ID_MAX + 1U];
 static bool node_laser_cached[CAN_NODE_ID_MAX + 1U];
+static uint32_t node_laser_sent_ms[CAN_NODE_ID_MAX + 1U];
 static uint32_t can_last_activity_ms = 0;
 static uint32_t can_flash_until_ms = 0;
 static uint32_t usb_last_activity_ms = 0;
@@ -145,7 +166,18 @@ static bool usb_activity_seen = false;
 CAN_DEFINE_MSGQ(can_rx_msgq, 32);
 K_MSGQ_DEFINE(can_tx_result_msgq, sizeof(can_tx_result_t), 8, 4);
 K_MUTEX_DEFINE(usb_tx_mutex);
-static atomic_t can_tx_pending;
+/* Controle de TX CAN: bit n = frame pendente para o node n (bit 0 = broadcast). Liberado
+ * pelo callback de conclusão (ISR); a espera no semáforo cede a CPU à thread de RX CAN. */
+static volatile uint32_t can_tx_pending_mask;
+static volatile uint32_t can_tx_in_flight;
+K_SEM_DEFINE(can_tx_event_sem, 0, 1);
+/* U com commit sincronizado (USYNC 1, padrão) e commit ainda não enviado nesta rajada */
+static bool usync_enabled = true;
+static bool usync_commit_pending;
+/* Acorda o loop principal assim que chegam bytes na COM (antes: polling com sleep de 1 ms). */
+K_SEM_DEFINE(usb_rx_sem, 0, 1);
+/* Bitrate em uso: comeca no do devicetree e muda com CANBR/CANBR_LOCAL (nao persiste). */
+static uint32_t can_bitrate_current = DT_PROP(DT_CHOSEN(zephyr_can_primary), bus_speed);
 static atomic_t can_raw_trace_enabled;
 
 /* Pilhas de execução das threads secundárias */
@@ -266,12 +298,16 @@ static inline void ws2812_send_pixel(uint8_t r, uint8_t g, uint8_t b) {
 }
 
 static void ws2812_show(void) {
-    unsigned int key = irq_lock();
+    /* IRQs bloqueadas só durante cada pixel (~30 us), não a fita inteira (~360 us).
+     * O FlexCAN tem um único mailbox RX por filtro: com 360 us sem ISR, rajadas de
+     * ACK/STATUS/POS dos 10 nós sobrescreviam o mailbox e frames eram perdidos.
+     * Uma ISR entre pixels apenas alonga o nível baixo, bem abaixo do tempo de latch. */
     for (int i = 0; i < NUM_LEDS; i++) {
+        unsigned int key = irq_lock();
         ws2812_send_pixel(leds[i].r, leds[i].g, leds[i].b);
+        WS2812_DR_CLEAR = WS2812_PIN_MASK;
+        irq_unlock(key);
     }
-    WS2812_DR_CLEAR = WS2812_PIN_MASK;
-    irq_unlock(key);
 }
 
 /* ========================================================================= */
@@ -339,7 +375,11 @@ void led_strip_thread(void *p1, void *p2, void *p3) {
             }
         }
 
-        ws2812_show();
+        /* Só retransmite quando algum LED mudou: menos janelas com IRQ bloqueada. */
+        if (memcmp(leds, leds_shown, sizeof(leds)) != 0) {
+            ws2812_show();
+            memcpy(leds_shown, leds, sizeof(leds));
+        }
         k_msleep(30); /* ~33 FPS para transições suaves */
     }
 }
@@ -534,6 +574,51 @@ static void write_can_raw_frame(const struct device *usb_dev,
     write_usb_serial(usb_dev, reply_buf);
 }
 
+static bool can_tx_try_acquire(unsigned node_id) {
+    uint32_t bit = 1U << node_id;
+    bool ok;
+    unsigned int key = irq_lock();
+
+    if (node_id == 0U) {
+        ok = (can_tx_pending_mask == 0U);
+    } else {
+        ok = (can_tx_pending_mask & (bit | 1U)) == 0U &&
+             can_tx_in_flight < CAN_TX_MAX_IN_FLIGHT;
+    }
+    if (ok) {
+        can_tx_pending_mask |= bit;
+        can_tx_in_flight++;
+    }
+    irq_unlock(key);
+    return ok;
+}
+
+/* Também chamado do ISR (callback de TX). */
+static void can_tx_release(unsigned node_id) {
+    unsigned int key = irq_lock();
+
+    can_tx_pending_mask &= ~(1U << node_id);
+    if (can_tx_in_flight > 0U) {
+        can_tx_in_flight--;
+    }
+    irq_unlock(key);
+    k_sem_give(&can_tx_event_sem);
+}
+
+static bool can_tx_acquire(unsigned node_id, k_timeout_t timeout) {
+    int64_t deadline = k_uptime_ticks() + (int64_t)timeout.ticks;
+
+    while (!can_tx_try_acquire(node_id)) {
+        int64_t left = deadline - k_uptime_ticks();
+        if (left <= 0) {
+            return false;
+        }
+        /* Acorda a cada conclusão de TX e reavalia */
+        (void)k_sem_take(&can_tx_event_sem, K_TICKS(left));
+    }
+    return true;
+}
+
 /* Executado pelo driver FlexCAN em contexto de interrupção. Manter apenas
  * operações ISR-safe; a formatação e o envio USB ficam no loop principal. */
 static void can_tx_callback(uint32_t error_flags, void *arg) {
@@ -543,7 +628,7 @@ static void can_tx_callback(uint32_t error_flags, void *arg) {
     };
 
     (void)k_msgq_put(&can_tx_result_msgq, &result, K_NO_WAIT);
-    atomic_clear(&can_tx_pending);
+    can_tx_release(result.node_id);
 }
 
 static void report_can_tx_results(const struct device *usb_dev) {
@@ -617,19 +702,10 @@ static int send_can_command_ex(const struct device *usb_dev,
 
     /* can_send() síncrono no driver FlexCAN do Zephyr 2.7 espera K_FOREVER
      * pela conclusão. Sem transceiver ou ACK isso congelava também a USB.
-     * Manter um único envio assíncrono pendente evita bloquear o protocolo e
-     * impede esgotar mailboxes se o hardware CAN estiver desconectado.
-     * Durante streaming de blocos OTA, permite até 1ms de micro-retry para
-     * que a conclusão do frame anterior libere o TX sem gerar erro falso de BUSY. */
-    bool acquired = false;
-    for (int retry = 0; retry < busy_retries; retry++) {
-        if (atomic_cas(&can_tx_pending, 0, 1)) {
-            acquired = true;
-            break;
-        }
-        k_busy_wait(100);
-    }
-    if (!acquired) {
+     * Envios assíncronos limitados (CAN_TX_MAX_IN_FLIGHT, um por node) não bloqueiam
+     * o protocolo nem esgotam mailboxes se o hardware CAN estiver desconectado.
+     * busy_retries é expresso em unidades de 100 us de espera pelo slot. */
+    if (!can_tx_acquire(node_id, K_USEC(busy_retries * 100))) {
         snprintf(reply_buf, sizeof(reply_buf),
                  "TEENSY_ERROR CAN_TX_BUSY %u\r\n", node_id);
         write_usb_serial(usb_dev, reply_buf);
@@ -639,7 +715,7 @@ static int send_can_command_ex(const struct device *usb_dev,
     err = can_send(can_dev, &frame, K_MSEC(50), can_tx_callback,
                    UINT_TO_POINTER(node_id));
     if (err != 0) {
-        atomic_clear(&can_tx_pending);
+        can_tx_release(node_id);
         snprintf(reply_buf, sizeof(reply_buf),
                  "TEENSY_ERROR CAN_SEND_FAILED %u %d\r\n", node_id, err);
         write_usb_serial(usb_dev, reply_buf);
@@ -649,6 +725,87 @@ static int send_can_command_ex(const struct device *usb_dev,
     }
 
     return err;
+}
+
+/* node 0 (broadcast) afeta todos os nós: invalida o cache de cada um. */
+static void laser_cache_invalidate(unsigned node_id) {
+    if (node_id == 0U) {
+        memset(node_laser_cached, 0, sizeof(node_laser_cached));
+    } else if (node_id <= CAN_NODE_ID_MAX) {
+        node_laser_cached[node_id] = false;
+    }
+}
+
+static bool laser_cache_matches(unsigned node_id, uint16_t laser1, uint16_t laser2) {
+    uint32_t now = k_uptime_get_32();
+
+    if (node_id > CAN_NODE_ID_MAX) {
+        return false;
+    }
+    if (node_id == 0U) {
+        /* Um broadcast só é redundante se todos os nós já estão nesse nível. */
+        for (unsigned i = CAN_NODE_ID_MIN; i <= CAN_NODE_ID_MAX; i++) {
+            if (!laser_cache_matches(i, laser1, laser2)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return node_laser_cached[node_id] &&
+           node_last_laser1[node_id] == laser1 &&
+           node_last_laser2[node_id] == laser2 &&
+           (now - node_laser_sent_ms[node_id]) < LASER_CACHE_REFRESH_MS;
+}
+
+static void laser_cache_store(unsigned node_id, uint16_t laser1, uint16_t laser2) {
+    uint32_t now = k_uptime_get_32();
+    unsigned first = (node_id == 0U) ? CAN_NODE_ID_MIN : node_id;
+    unsigned last = (node_id == 0U) ? CAN_NODE_ID_MAX : node_id;
+
+    if (node_id > CAN_NODE_ID_MAX) {
+        return;
+    }
+    for (unsigned i = first; i <= last; i++) {
+        node_last_laser1[i] = laser1;
+        node_last_laser2[i] = laser2;
+        node_laser_sent_ms[i] = now;
+        node_laser_cached[i] = true;
+    }
+}
+
+static bool can_bitrate_is_valid(uint32_t bitrate) {
+    return bitrate == 125000U || bitrate == 250000U || bitrate == 500000U ||
+           bitrate == 1000000U;
+}
+
+/* Troca so o bitrate do Teensy, com o mesmo calculo de timing do boot (sample point 80%,
+ * igual aos nodes). Espera o frame em voo: trocar o timing no meio dele o corromperia. */
+static int can_switch_local_bitrate(const struct device *can_dev, uint32_t bitrate) {
+    struct can_timing timing;
+    int ret;
+
+    /* Como um broadcast: espera todos os frames em voo terminarem */
+    if (!can_tx_acquire(0U, K_MSEC(100))) {
+        return -EBUSY;
+    }
+    ret = can_calc_timing(can_dev, &timing, bitrate, 800);
+    if (ret >= 0) {
+        timing.sjw = CAN_SJW_NO_CHANGE;
+        ret = can_set_timing(can_dev, &timing, NULL);
+    }
+    can_tx_release(0U);
+    if (ret < 0) {
+        return ret;
+    }
+    can_bitrate_current = bitrate;
+    return 0;
+}
+
+static void usb_cdc_irq_callback(const struct device *dev, void *user_data) {
+    ARG_UNUSED(dev);
+    ARG_UNUSED(user_data);
+    /* Executa na workqueue USB: so sinaliza; a leitura continua via uart_poll_in. */
+    k_sem_give(&usb_rx_sem);
 }
 
 static int send_can_command(const struct device *usb_dev,
@@ -699,12 +856,17 @@ static void process_usb_command(const struct device *usb_dev,
             flags = arg1;
         }
         uint8_t payload[2] = {CAN_OP_STOP, (uint8_t)flags};
+        if ((flags & STOP_FLAG_LASERS_OFF) != 0U) {
+            laser_cache_invalidate(node_id);
+        }
         if (send_can_command_ex(usb_dev, can_dev, node_id, payload, ARRAY_SIZE(payload),
                                 CAN_TX_BUSY_RETRIES_STOP) == 0) {
             char reply_buf[48];
             snprintf(reply_buf, sizeof(reply_buf), "TEENSY_OK STOP %u %u\r\n", node_id, flags);
             write_usb_serial(usb_dev, reply_buf);
         }
+        /* Sem este return o STOP caía na cadeia abaixo e também gerava UNKNOWN_COMMAND. */
+        return;
     }
     /* Comando Unificado TouchDesigner: U/UF/TD/SYNC <node> <deg_c> <deg_a> <mm_z> <laser1> <laser2>
      * Coordenadas absolutas dos 3 eixos (C, A, Z) e níveis PWM 12-bit dos 2 lasers (0..4095).
@@ -720,7 +882,7 @@ static void process_usb_command(const struct device *usb_dev,
         unsigned laser2 = 0;
         int32_t angle_c_centi = 0;
         int32_t angle_a_centi = 0;
-        int16_t distance_z_centi = 0;
+        int16_t distance_z_units = 0;
         bool force_sync = (strncmp(cmd, "UF ", 3) == 0 || strncmp(cmd, "uf ", 3) == 0);
 
         int parsed = sscanf(cmd, "%*s %u %f %f %f %u %u",
@@ -729,13 +891,20 @@ static void process_usb_command(const struct device *usb_dev,
         if (parsed != 6 || laser1 > 4095U || laser2 > 4095U ||
             !encode_sync_fixed_i32(angle_c_deg, 100.0f, -262144, 262143, &angle_c_centi) ||
             !encode_sync_fixed_i32(angle_a_deg, 100.0f, -262144, 262143, &angle_a_centi) ||
-            !encode_sync_fixed(distance_z_mm, 100.0f, &distance_z_centi)) {
+            !encode_sync_fixed(distance_z_mm, CAN_Z_UNITS_PER_MM, &distance_z_units)) {
             write_invalid_argument(usb_dev, "UNIFIED");
+            return;
+        }
+        if (!can_node_id_is_valid(node_id)) {
+            char reply_buf[64];
+            snprintf(reply_buf, sizeof(reply_buf),
+                     "TEENSY_ERROR INVALID_NODE_ID %u\r\n", node_id);
+            write_usb_serial(usb_dev, reply_buf);
             return;
         }
 
         /* 1. Frame de movimento com coordenadas absolutas em centésimos de grau (C/A em 19-bit assinado: +-2621.43 deg)
-         * e centésimos de mm (Z em 16-bit: 0..327.67 mm).
+         * e Z em int16 de 0,02 mm (+-655.34 mm: cobre o curso de 480 mm).
          * Byte 7: bit0=force_sync, bits 1..3=C bits 16..18, bits 4..6=A bits 16..18. */
         uint8_t move_payload[8];
         uint32_t c_u19 = (uint32_t)angle_c_centi & 0x7FFFFU;
@@ -745,20 +914,21 @@ static void process_usb_command(const struct device *usb_dev,
         move_payload[2] = (uint8_t)((c_u19 >> 8) & 0xFFU);
         move_payload[3] = (uint8_t)(a_u19 & 0xFFU);
         move_payload[4] = (uint8_t)((a_u19 >> 8) & 0xFFU);
-        encode_i16_le(&move_payload[5], distance_z_centi);
+        encode_i16_le(&move_payload[5], distance_z_units);
         uint8_t c_hi = (uint8_t)((c_u19 >> 16) & 0x07U);
         uint8_t a_hi = (uint8_t)((a_u19 >> 16) & 0x07U);
-        move_payload[7] = (force_sync ? 0x01U : 0x00U) | (uint8_t)(c_hi << 1) | (uint8_t)(a_hi << 4);
-        int ret_m = send_can_command_ex(usb_dev, can_dev, node_id, move_payload,
-                                        ARRAY_SIZE(move_payload), CAN_TX_BUSY_RETRIES_NORMAL);
+        move_payload[7] = (force_sync ? 0x01U : 0x00U) | (uint8_t)(c_hi << 1) | (uint8_t)(a_hi << 4) |
+                          (usync_enabled ? CAN_UNIFIED_LATCH_FLAG : 0x00U);
+        if (send_can_command_ex(usb_dev, can_dev, node_id, move_payload,
+                                ARRAY_SIZE(move_payload), CAN_TX_BUSY_RETRIES_NORMAL) == 0 &&
+            usync_enabled) {
+            usync_commit_pending = true; /* o loop principal envia o commit no fim da rajada */
+        }
 
-        /* 2. Frame de controle simultâneo dos 2 lasers (apenas se houve alteração nos níveis para economizar 50% de banda CAN) */
+        /* 2. Frame de controle simultâneo dos 2 lasers, suprimido quando repete o último nível
+         * enviado há menos de LASER_CACHE_REFRESH_MS (economiza banda CAN em streaming). */
         int ret_l = 0;
-        bool laser_changed = (node_id <= CAN_NODE_ID_MAX) &&
-                             (!node_laser_cached[node_id] ||
-                              node_last_laser1[node_id] != (uint16_t)laser1 ||
-                              node_last_laser2[node_id] != (uint16_t)laser2);
-        if (laser_changed) {
+        if (!laser_cache_matches(node_id, (uint16_t)laser1, (uint16_t)laser2)) {
             uint8_t laser_payload[5];
             laser_payload[0] = CAN_OP_LASER_DUAL;
             laser_payload[1] = (uint8_t)(laser1 & 0xFFU);
@@ -767,20 +937,14 @@ static void process_usb_command(const struct device *usb_dev,
             laser_payload[4] = (uint8_t)((laser2 >> 8) & 0x0FU);
             ret_l = send_can_command_ex(usb_dev, can_dev, node_id, laser_payload,
                                         ARRAY_SIZE(laser_payload), CAN_TX_BUSY_RETRIES_CHAINED);
-            if (ret_l == 0 && node_id <= CAN_NODE_ID_MAX) {
-                node_last_laser1[node_id] = (uint16_t)laser1;
-                node_last_laser2[node_id] = (uint16_t)laser2;
-                node_laser_cached[node_id] = true;
+            if (ret_l == 0) {
+                laser_cache_store(node_id, (uint16_t)laser1, (uint16_t)laser2);
+            } else {
+                laser_cache_invalidate(node_id);
             }
         }
-
-        if (ret_m == 0 && ret_l == 0) {
-            char reply_buf[80];
-            snprintf(reply_buf, sizeof(reply_buf), "TEENSY_OK U %u %.2f %.2f %.2f %u %u\r\n",
-                     node_id, (double)angle_c_deg, (double)angle_a_deg, (double)distance_z_mm,
-                     laser1, laser2);
-            write_usb_serial(usb_dev, reply_buf);
-        }
+        /* Sucesso é silencioso: em streaming (10 nós a 60 Hz) um eco por comando dobrava o
+         * tráfego USB. Falhas continuam chegando como TEENSY_ERROR. */
     }
     /* Movimento sincronizado físico com coordenadas absolutas (MS/MSF <node> <deg_c> <deg_a> <mm_z> [laser1] [laser2]) */
     else if ((strncmp(cmd, "MS ", 3) == 0 || strncmp(cmd, "ms ", 3) == 0 ||
@@ -792,7 +956,7 @@ static void process_usb_command(const struct device *usb_dev,
         unsigned laser2 = 0;
         int16_t angle_c_deci = 0;
         int16_t angle_a_deci = 0;
-        int16_t distance_z_centi = 0;
+        int16_t distance_z_units = 0;
         uint8_t payload[8];
         bool force_sync = (strncmp(cmd, "MSF ", 4) == 0 ||
                            strncmp(cmd, "msf ", 4) == 0);
@@ -802,7 +966,7 @@ static void process_usb_command(const struct device *usb_dev,
         if (parsed < 4 ||
             !encode_sync_fixed(angle_c_deg, 10.0f, &angle_c_deci) ||
             !encode_sync_fixed(angle_a_deg, 10.0f, &angle_a_deci) ||
-            !encode_sync_fixed(distance_z_mm, 100.0f, &distance_z_centi)) {
+            !encode_sync_fixed(distance_z_mm, CAN_Z_UNITS_PER_MM, &distance_z_units)) {
             write_invalid_argument(usb_dev, "MOVE_SYNC");
             return;
         }
@@ -810,7 +974,7 @@ static void process_usb_command(const struct device *usb_dev,
         payload[0] = CAN_OP_MOVE_SYNC;
         encode_i16_le(&payload[1], angle_c_deci);
         encode_i16_le(&payload[3], angle_a_deci);
-        encode_i16_le(&payload[5], distance_z_centi);
+        encode_i16_le(&payload[5], distance_z_units);
         payload[7] = force_sync ? 0x01U : 0x00U;
         int ret = send_can_command_ex(usb_dev, can_dev, node_id, payload,
                                       ARRAY_SIZE(payload), CAN_TX_BUSY_RETRIES_NORMAL);
@@ -822,8 +986,12 @@ static void process_usb_command(const struct device *usb_dev,
             laser_payload[2] = (uint8_t)((laser1 >> 8) & 0x0FU);
             laser_payload[3] = (uint8_t)(laser2 & 0xFFU);
             laser_payload[4] = (uint8_t)((laser2 >> 8) & 0x0FU);
-            (void)send_can_command_ex(usb_dev, can_dev, node_id, laser_payload,
-                                      ARRAY_SIZE(laser_payload), CAN_TX_BUSY_RETRIES_CHAINED);
+            if (send_can_command_ex(usb_dev, can_dev, node_id, laser_payload,
+                                    ARRAY_SIZE(laser_payload), CAN_TX_BUSY_RETRIES_CHAINED) == 0) {
+                laser_cache_store(node_id, (uint16_t)laser1, (uint16_t)laser2);
+            } else {
+                laser_cache_invalidate(node_id);
+            }
         }
 
         if (ret == 0) {
@@ -910,6 +1078,8 @@ static void process_usb_command(const struct device *usb_dev,
         payload[1] = (uint8_t)arg1;
         payload[2] = (uint8_t)(arg2 & 0xFFU);
         payload[3] = (uint8_t)((arg2 >> 8) & 0xFFU);
+        /* O laser mudou fora do U/MS: o próximo U precisa reenviar o nível. */
+        laser_cache_invalidate(node_id);
         (void)send_can_command(usb_dev, can_dev, node_id, payload, ARRAY_SIZE(payload));
     }
     /* Fan (F <node> <mode 0=Off, 1=On, 2=Auto>) */
@@ -957,6 +1127,63 @@ static void process_usb_command(const struct device *usb_dev,
         write_usb_serial(usb_dev, arg1 != 0U ?
                          "TEENSY_OK CAN_RAW 1\r\n" :
                          "TEENSY_OK CAN_RAW 0\r\n");
+    }
+    /* Commit sincronizado do U: USYNC 1 (padrão) = os nodes aplicam juntos no fim de cada
+     * rajada; USYNC 0 = cada node aplica ao receber. USYNC sem argumento informa. */
+    else if (strncmp(cmd, "USYNC", 5) == 0 || strncmp(cmd, "usync", 5) == 0) {
+        unsigned enable = 0;
+        if (sscanf(cmd + 5, "%u", &enable) == 1) {
+            if (enable > 1U) {
+                write_invalid_argument(usb_dev, "USYNC");
+                return;
+            }
+            usync_enabled = (enable != 0U);
+        }
+        write_usb_serial(usb_dev, usync_enabled ? "TEENSY_OK USYNC 1\r\n" : "TEENSY_OK USYNC 0\r\n");
+    }
+    /* Bitrate do barramento: CANBR <bps> migra nodes (broadcast) e Teensy juntos;
+     * CANBR_LOCAL <bps> muda só o Teensy (para alcançar nodes num bitrate antigo);
+     * CANBR sem argumento informa o bitrate atual. */
+    else if (strncmp(cmd, "CANBR", 5) == 0 || strncmp(cmd, "canbr", 5) == 0) {
+        bool local_only = (strncmp(cmd + 5, "_LOCAL", 6) == 0 ||
+                           strncmp(cmd + 5, "_local", 6) == 0);
+        const char *args = cmd + (local_only ? 11 : 5);
+        unsigned bitrate = 0;
+        char reply_buf[64];
+
+        if (sscanf(args, "%u", &bitrate) != 1) {
+            snprintf(reply_buf, sizeof(reply_buf), "TEENSY_OK CANBR %lu\r\n",
+                     (unsigned long)can_bitrate_current);
+            write_usb_serial(usb_dev, reply_buf);
+            return;
+        }
+        if (!can_bitrate_is_valid(bitrate)) {
+            write_invalid_argument(usb_dev, "CANBR");
+            return;
+        }
+        if (!local_only) {
+            uint8_t payload[5] = {
+                CAN_OP_SET_BITRATE,
+                (uint8_t)(bitrate & 0xFFU),
+                (uint8_t)((bitrate >> 8) & 0xFFU),
+                (uint8_t)((bitrate >> 16) & 0xFFU),
+                (uint8_t)((bitrate >> 24) & 0xFFU),
+            };
+            if (send_can_command_ex(usb_dev, can_dev, 0U, payload, ARRAY_SIZE(payload),
+                                    CAN_TX_BUSY_RETRIES_STOP) != 0) {
+                return;
+            }
+            /* ACKs dos nodes ainda saem no bitrate antigo; eles trocam ~30 ms depois */
+            k_msleep(20);
+        }
+        int ret = can_switch_local_bitrate(can_dev, bitrate);
+        if (ret == 0) {
+            snprintf(reply_buf, sizeof(reply_buf), "TEENSY_OK CANBR %u%s\r\n", bitrate,
+                     local_only ? " LOCAL" : "");
+        } else {
+            snprintf(reply_buf, sizeof(reply_buf), "TEENSY_ERROR CANBR_FAILED %d\r\n", ret);
+        }
+        write_usb_serial(usb_dev, reply_buf);
     }
     /* Solicitação de Status (R <node>) */
     else if ((cmd[0] == 'R' || cmd[0] == 'r') && sscanf(cmd, "%*c %u", &node_id) == 1) {
@@ -1276,6 +1503,9 @@ void main(void) {
         return;
     }
 
+    uart_irq_callback_set(usb_dev, usb_cdc_irq_callback);
+    uart_irq_rx_enable(usb_dev);
+
     /* Cada máscara 0x7F0 cobre exatamente um grupo de 16 IDs. */
     struct zcan_filter status_filter = {
         .id_type = CAN_STANDARD_IDENTIFIER,
@@ -1376,7 +1606,18 @@ void main(void) {
             }
         }
         if (rx_count == 0) {
-            k_msleep(1);
+            if (usync_commit_pending) {
+                /* Rajada de U do TD terminou (COM parada por USYNC_IDLE_US): um broadcast
+                 * faz todos os nodes aplicarem o alvo no mesmo instante. */
+                if (k_sem_take(&usb_rx_sem, K_USEC(USYNC_IDLE_US)) != 0) {
+                    const uint8_t commit[1] = {CAN_OP_SYNC_COMMIT};
+                    usync_commit_pending = false;
+                    (void)send_can_command(usb_dev, can_dev, 0U, commit, ARRAY_SIZE(commit));
+                }
+            } else {
+                /* Acorda na chegada de bytes; o timeout mantém DTR e erros de TX em dia */
+                (void)k_sem_take(&usb_rx_sem, K_MSEC(5));
+            }
         }
     }
 }

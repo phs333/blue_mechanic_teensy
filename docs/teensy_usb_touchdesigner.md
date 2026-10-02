@@ -2,6 +2,8 @@
 
 Este documento descreve a integração do TouchDesigner com o bridge. Os nomes canônicos dos eixos são **C** (base), **A** (pivot) e **Z** (linear). `X` e `Y` existem somente como aliases legados de `C` e `A`.
 
+> Guia prático para montar a rede do TD (comandos, respostas, tempos e valores recomendados): [touchdesigner_parametrizacao.md](./touchdesigner_parametrizacao.md).
+
 ## Visao geral
 
 O Teensy 4.1 atua como uma ponte entre o TouchDesigner e a rede CAN dos nodes ESP32.
@@ -112,7 +114,7 @@ MSF <node_id> <graus_c> <graus_a> <mm_z>
 ```
 
 - C/A são deslocamentos relativos com resolução CAN de `0,1°`.
-- Z é deslocamento relativo com resolução CAN de `0,01 mm`.
+- Z é posição absoluta com resolução CAN de `0,02 mm` (±655,34 mm: cobre o curso de 480 mm).
 - O Teensy monta um único frame CAN de opcode `0x23` e DLC 8.
 - O ESP32 converte as unidades físicas usando sua configuração e inicia os três canais RMT juntos.
 - `MSF` ignora encoder e limites angulares de C/A; as proteções físicas de Z continuam ativas.
@@ -124,6 +126,42 @@ Exemplos:
 MS 1 90.0 -45.0 10.00
 MSF 2 5.0 5.0 -2.50
 ```
+
+---
+
+### 2.2. Streaming de posição absoluta (U / UF) — recomendado para o TouchDesigner
+
+Sintaxe:
+
+```text
+U  <node_id> <graus_c> <graus_a> <mm_z> <laser1> <laser2>
+UF <node_id> <graus_c> <graus_a> <mm_z> <laser1> <laser2>
+```
+
+- Coordenadas **absolutas**: C/A em graus (resolução 0,01°, faixa ±2621,43°), Z em mm (0,02 mm, até 480 mm de curso).
+- `laser1`/`laser2`: PWM 12 bits (`0..4095`). O frame de laser só é reenviado quando o nível muda
+  (ou a cada 250 ms, para se corrigir após um reboot do node ou um `ESTOP`).
+- `UF` ignora encoder e limites de C/A (malha aberta); as proteções de Z continuam ativas.
+- Sucesso é **silencioso** (sem `ACK`/`DONE`/`TEENSY_OK`); só falhas geram `ERROR`/`TEENSY_ERROR`.
+- **Commit sincronizado (`USYNC 1`, padrão):** o Teensy marca cada `U` como "aguardar" e, quando a COM
+  fica ~0,3 ms sem bytes (fim da rajada do frame do TD), envia um broadcast de commit (`0x26`). Todos
+  os nodes aplicam o alvo no mesmo instante, sem a diferença de ~1–2 ms entre o node 1 e o node 10.
+  Mande os `U` de todos os nodes de um frame juntos, em sequência. Se um commit se perder, o node
+  aplica sozinho após 10 ms. `USYNC 0` volta a aplicar cada `U` ao chegar; `USYNC` informa o modo.
+- O Teensy mantém até 4 frames CAN em voo (no máximo 1 por node, preservando a ordem de cada node).
+  Broadcasts (`STOP`/`ESTOP`, commit, `CANBR`) esperam os frames pendentes saírem antes de serem enviados.
+- Envie um `U` por node a cada frame do TD, em taxa constante (30–120 Hz; 60 Hz ou mais recomendado).
+  A taxa pode mudar a qualquer momento: o node mede o intervalo entre frames.
+
+Como o node executa:
+
+- Não há fila: cada `U` só atualiza o alvo de um seguidor em tempo real (segmentos de 5 ms).
+- O node estima a velocidade do alvo pela diferença entre frames (feedforward) e extrapola o alvo
+  entre eles, compensando o atraso interno. Numa trajetória contínua o erro de acompanhamento
+  fica em ~1° a 60–120 Hz (contra ~20° de um seguidor só de posição).
+- Aceleração (`ACCEL`) e jerk (`MOTION TJERK`) limitam a curva S; a velocidade máxima é `SPEED_MAX`.
+- Se o TD parar de mandar frames, o alvo para onde estava; 0,5 s depois o seguidor encerra.
+- Trajetórias com mudanças bruscas (degraus) são suavizadas pelos limites de aceleração/jerk.
 
 ---
 
@@ -315,6 +353,21 @@ Enquanto ativo, o Teensy emite antes da linha decodificada:
 ```text
 CAN_RAW 291 8 D2 04 7B 00 00 00 FA 00
 ```
+
+---
+
+### 10. Bitrate do barramento CAN (CANBR)
+
+```text
+CANBR                 -> TEENSY_OK CANBR <bitrate atual>
+CANBR <bps>           -> broadcast para todos os nodes trocarem + troca o Teensy
+CANBR_LOCAL <bps>     -> troca só o Teensy
+```
+
+- Valores aceitos: `125000`, `250000`, `500000`, `1000000`. O Teensy inicia sempre em **1 Mbps**.
+- Os nodes gravam o novo bitrate na NVS e trocam ~30 ms depois do `ACK` (que ainda sai no bitrate antigo).
+- Migração de nodes que estão em 500 kbps: `CANBR_LOCAL 500000` e depois `CANBR 1000000`.
+- Nodes gravados de fábrica com o firmware novo já nascem em 1 Mbps.
 
 ---
 
@@ -548,6 +601,9 @@ TEENSY_ERROR UNKNOWN_COMMAND
 | `H` | Home | `0x21` |
 | `MF` | Move em malha aberta | `0x22` |
 | `MS` / `MSF` | Move C+A+Z sincronizado | `0x23` |
+| `U` / `UF` | Alvo absoluto em streaming (+ lasers `0x32` quando mudam) | `0x25` |
+| `CANBR` | Troca de bitrate (broadcast) | `0x15` |
+| (automático, `USYNC 1`) | Commit sincronizado dos `U` | `0x26` |
 | `L` | Laser | `0x30` |
 | `F` | Fan | `0x31` |
 

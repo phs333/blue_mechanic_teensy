@@ -250,10 +250,10 @@ Dispara um movimento relativo sincronizado de C, A e Z no próprio ESP32. O payl
 | 0 | Opcode (`0x23`) |
 | 1–2 | ΔC `int16` little-endian em décimos de grau (`0,1°`) |
 | 3–4 | ΔA `int16` little-endian em décimos de grau (`0,1°`) |
-| 5–6 | ΔZ `int16` little-endian em centésimos de milímetro (`0,01 mm`) |
+| 5–6 | Z absoluto `int16` little-endian em unidades de `0,02 mm` (mesmo campo no `0x25`) |
 | 7 | Flags: bit 0 = forçar C/A sem encoder; bits 1–7 reservados e obrigatoriamente zero |
 
-O ESP32 converte as unidades físicas para passos usando `steps_per_rev`, microsteps e polia Z gravados localmente, enfileira um único `MOTION_CMD_MOVE_SYNC` e inicia os três canais RMT pelo mesmo planejador. A faixa representável é ±3276,7° para C/A e aproximadamente ±327,67 mm para Z.
+O ESP32 converte as unidades físicas para passos usando `steps_per_rev`, microsteps e polia Z gravados localmente, enfileira um único `MOTION_CMD_MOVE_SYNC` e inicia os três canais RMT pelo mesmo planejador. A faixa representável é ±3276,7° para C/A e ±655,34 mm para Z (cobre o curso de 480 mm).
 
 Perfis `CAN_OP_MOVE_PROFILE` opcionais podem ser enviados para C, A e Z imediatamente antes do trigger. As velocidades são consumidas por eixo; a aceleração compartilhada deve ser igual nos perfis usados. Sem perfil, o ESP32 usa a configuração persistida.
 

@@ -1,6 +1,8 @@
 &flexcan1 {
     status = "okay";
-    bus-speed = <500000>;
+    /* 1 Mbps (padrao dos nodes novos). Nodes ainda em 500 kbps: CANBR_LOCAL 500000 e
+     * depois CANBR 1000000 migra todos de uma vez. */
+    bus-speed = <1000000>;
     sample-point = <800>;
 };
 
