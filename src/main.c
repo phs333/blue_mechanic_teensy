@@ -60,8 +60,10 @@ BUILD_ASSERT(CAN_POS_BASE_ID + CAN_NODE_ID_MAX < CAN_EVENT_BASE_ID,
 #define CAN_OP_MOVE_FORCE     0x22U
 #define CAN_OP_MOVE_SYNC      0x23U
 #define CAN_OP_STOP           0x24U /* [0x24, flags]; bit0 = apagar lasers (E-STOP) */
+#define CAN_OP_MOVE_UNIFIED   0x25U /* Movimento unificado 3 eixos absolutos */
 #define CAN_OP_LASER          0x30U
 #define CAN_OP_FAN            0x31U
+#define CAN_OP_LASER_DUAL     0x32U /* Controle simultâneo dos 2 lasers: [0x32, L1_lo, L1_hi, L2_lo, L2_hi] */
 #define CAN_OP_OTA_START      0x40U
 #define CAN_OP_OTA_DATA       0x41U
 #define CAN_OP_OTA_END        0x42U
@@ -84,10 +86,13 @@ BUILD_ASSERT(CAN_POS_BASE_ID + CAN_NODE_ID_MAX < CAN_EVENT_BASE_ID,
 #define CAN_STATUS_FLAG_POS_V2 0x40U
 #define STOP_FLAG_LASERS_OFF   0x01U
 
-/* Tentativas de 100 us para obter o slot de TX: comandos comuns esperam até 1 ms;
- * o STOP espera até 20 ms para não ser descartado atrás de um frame em andamento. */
-#define CAN_TX_BUSY_RETRIES_NORMAL 10
-#define CAN_TX_BUSY_RETRIES_STOP   200
+/* Tentativas de 100 us para obter o slot de TX:
+ * - Comandos comuns e polling R esperam até 25 ms para não perder telemetria;
+ * - STOP/ESTOP espera até 50 ms com prioridade máxima;
+ * - Frames encadeados (laser pós-movimento em U/MS) esperam até 50 ms pelo fim do primeiro frame. */
+#define CAN_TX_BUSY_RETRIES_NORMAL  250
+#define CAN_TX_BUSY_RETRIES_STOP    500
+#define CAN_TX_BUSY_RETRIES_CHAINED 500
 
 /* ========================================================================= */
 /* Configuração da Fita de LED WS2812 (12 LEDs no Pino 14 do Teensy 4.1)     */
@@ -678,12 +683,70 @@ static void process_usb_command(const struct device *usb_dev,
             write_usb_serial(usb_dev, reply_buf);
         }
     }
-    /* Movimento sincronizado físico (MS/MSF <node> <deg_c> <deg_a> <mm_z>) */
-    if ((strncmp(cmd, "MS ", 3) == 0 || strncmp(cmd, "ms ", 3) == 0 ||
-         strncmp(cmd, "MSF ", 4) == 0 || strncmp(cmd, "msf ", 4) == 0)) {
+    /* Comando Unificado TouchDesigner: U/UF/TD/SYNC <node> <deg_c> <deg_a> <mm_z> <laser1> <laser2>
+     * Coordenadas absolutas dos 3 eixos (C, A, Z) e níveis PWM 12-bit dos 2 lasers (0..4095).
+     * Node 0 = Broadcast simultâneo para todos os 10 nós. */
+    if (strncmp(cmd, "U ", 2) == 0 || strncmp(cmd, "u ", 2) == 0 ||
+        strncmp(cmd, "UF ", 3) == 0 || strncmp(cmd, "uf ", 3) == 0 ||
+        strncmp(cmd, "TD ", 3) == 0 || strncmp(cmd, "td ", 3) == 0 ||
+        strncmp(cmd, "SYNC ", 5) == 0 || strncmp(cmd, "sync ", 5) == 0) {
         float angle_c_deg = 0.0f;
         float angle_a_deg = 0.0f;
         float distance_z_mm = 0.0f;
+        unsigned laser1 = 0;
+        unsigned laser2 = 0;
+        int16_t angle_c_deci = 0;
+        int16_t angle_a_deci = 0;
+        int16_t distance_z_centi = 0;
+        bool force_sync = (strncmp(cmd, "UF ", 3) == 0 || strncmp(cmd, "uf ", 3) == 0);
+
+        int parsed = sscanf(cmd, "%*s %u %f %f %f %u %u",
+                            &node_id, &angle_c_deg, &angle_a_deg, &distance_z_mm,
+                            &laser1, &laser2);
+        if (parsed != 6 || laser1 > 4095U || laser2 > 4095U ||
+            !encode_sync_fixed(angle_c_deg, 10.0f, &angle_c_deci) ||
+            !encode_sync_fixed(angle_a_deg, 10.0f, &angle_a_deci) ||
+            !encode_sync_fixed(distance_z_mm, 100.0f, &distance_z_centi)) {
+            write_invalid_argument(usb_dev, "UNIFIED");
+            return;
+        }
+
+        /* 1. Frame de movimento com coordenadas absolutas */
+        uint8_t move_payload[8];
+        move_payload[0] = CAN_OP_MOVE_SYNC;
+        encode_i16_le(&move_payload[1], angle_c_deci);
+        encode_i16_le(&move_payload[3], angle_a_deci);
+        encode_i16_le(&move_payload[5], distance_z_centi);
+        move_payload[7] = force_sync ? 0x01U : 0x00U;
+        int ret_m = send_can_command_ex(usb_dev, can_dev, node_id, move_payload,
+                                        ARRAY_SIZE(move_payload), CAN_TX_BUSY_RETRIES_NORMAL);
+
+        /* 2. Frame de controle simultâneo dos 2 lasers */
+        uint8_t laser_payload[5];
+        laser_payload[0] = CAN_OP_LASER_DUAL;
+        laser_payload[1] = (uint8_t)(laser1 & 0xFFU);
+        laser_payload[2] = (uint8_t)((laser1 >> 8) & 0x0FU);
+        laser_payload[3] = (uint8_t)(laser2 & 0xFFU);
+        laser_payload[4] = (uint8_t)((laser2 >> 8) & 0x0FU);
+        int ret_l = send_can_command_ex(usb_dev, can_dev, node_id, laser_payload,
+                                        ARRAY_SIZE(laser_payload), CAN_TX_BUSY_RETRIES_CHAINED);
+
+        if (ret_m == 0 && ret_l == 0) {
+            char reply_buf[80];
+            snprintf(reply_buf, sizeof(reply_buf), "TEENSY_OK U %u %.1f %.1f %.2f %u %u\r\n",
+                     node_id, (double)angle_c_deg, (double)angle_a_deg, (double)distance_z_mm,
+                     laser1, laser2);
+            write_usb_serial(usb_dev, reply_buf);
+        }
+    }
+    /* Movimento sincronizado físico com coordenadas absolutas (MS/MSF <node> <deg_c> <deg_a> <mm_z> [laser1] [laser2]) */
+    else if ((strncmp(cmd, "MS ", 3) == 0 || strncmp(cmd, "ms ", 3) == 0 ||
+              strncmp(cmd, "MSF ", 4) == 0 || strncmp(cmd, "msf ", 4) == 0)) {
+        float angle_c_deg = 0.0f;
+        float angle_a_deg = 0.0f;
+        float distance_z_mm = 0.0f;
+        unsigned laser1 = 0;
+        unsigned laser2 = 0;
         int16_t angle_c_deci = 0;
         int16_t angle_a_deci = 0;
         int16_t distance_z_centi = 0;
@@ -691,8 +754,9 @@ static void process_usb_command(const struct device *usb_dev,
         bool force_sync = (strncmp(cmd, "MSF ", 4) == 0 ||
                            strncmp(cmd, "msf ", 4) == 0);
 
-        if (sscanf(cmd, "%*s %u %f %f %f", &node_id, &angle_c_deg,
-                   &angle_a_deg, &distance_z_mm) != 4 ||
+        int parsed = sscanf(cmd, "%*s %u %f %f %f %u %u", &node_id, &angle_c_deg,
+                            &angle_a_deg, &distance_z_mm, &laser1, &laser2);
+        if (parsed < 4 ||
             !encode_sync_fixed(angle_c_deg, 10.0f, &angle_c_deci) ||
             !encode_sync_fixed(angle_a_deg, 10.0f, &angle_a_deci) ||
             !encode_sync_fixed(distance_z_mm, 100.0f, &distance_z_centi)) {
@@ -705,7 +769,26 @@ static void process_usb_command(const struct device *usb_dev,
         encode_i16_le(&payload[3], angle_a_deci);
         encode_i16_le(&payload[5], distance_z_centi);
         payload[7] = force_sync ? 0x01U : 0x00U;
-        (void)send_can_command(usb_dev, can_dev, node_id, payload, ARRAY_SIZE(payload));
+        int ret = send_can_command_ex(usb_dev, can_dev, node_id, payload,
+                                      ARRAY_SIZE(payload), CAN_TX_BUSY_RETRIES_NORMAL);
+
+        if (parsed >= 6 && laser1 <= 4095U && laser2 <= 4095U) {
+            uint8_t laser_payload[5];
+            laser_payload[0] = CAN_OP_LASER_DUAL;
+            laser_payload[1] = (uint8_t)(laser1 & 0xFFU);
+            laser_payload[2] = (uint8_t)((laser1 >> 8) & 0x0FU);
+            laser_payload[3] = (uint8_t)(laser2 & 0xFFU);
+            laser_payload[4] = (uint8_t)((laser2 >> 8) & 0x0FU);
+            (void)send_can_command_ex(usb_dev, can_dev, node_id, laser_payload,
+                                      ARRAY_SIZE(laser_payload), CAN_TX_BUSY_RETRIES_CHAINED);
+        }
+
+        if (ret == 0) {
+            char reply_buf[64];
+            snprintf(reply_buf, sizeof(reply_buf), "TEENSY_OK MS %u %.1f %.1f %.2f\r\n",
+                     node_id, (double)angle_c_deg, (double)angle_a_deg, (double)distance_z_mm);
+            write_usb_serial(usb_dev, reply_buf);
+        }
     }
     /* Movimento Normal com correção (M <node> <axis> <steps>) */
     else if ((cmd[0] == 'M' || cmd[0] == 'm') && cmd[1] == ' ' &&
