@@ -130,6 +130,10 @@ typedef struct {
 static node_led_state_t node_states[CAN_NODE_ID_MAX + 1U];
 /* Formato de posição anunciado pelo último STATUS de cada nó (ver CAN_STATUS_FLAG_POS_V2) */
 static atomic_t node_pos_v2[CAN_NODE_ID_MAX + 1U];
+/* Cache dos níveis dos lasers para evitar envio redundante em stream contínuo */
+static uint16_t node_last_laser1[CAN_NODE_ID_MAX + 1U];
+static uint16_t node_last_laser2[CAN_NODE_ID_MAX + 1U];
+static bool node_laser_cached[CAN_NODE_ID_MAX + 1U];
 static uint32_t can_last_activity_ms = 0;
 static uint32_t can_flash_until_ms = 0;
 static uint32_t usb_last_activity_ms = 0;
@@ -470,6 +474,25 @@ static bool encode_sync_fixed(float value, float scale, int16_t *encoded) {
     return true;
 }
 
+static bool encode_sync_fixed_i32(float value, float scale, int32_t min_val, int32_t max_val, int32_t *encoded) {
+    float scaled;
+    long rounded;
+
+    if (!isfinite(value) || encoded == NULL) {
+        return false;
+    }
+    scaled = value * scale;
+    if (scaled < (float)min_val || scaled > (float)max_val) {
+        return false;
+    }
+    rounded = lroundf(scaled);
+    if (rounded < min_val || rounded > max_val) {
+        return false;
+    }
+    *encoded = (int32_t)rounded;
+    return true;
+}
+
 static void encode_i16_le(uint8_t *dest, int16_t value) {
     uint16_t raw = (uint16_t)value;
     dest[0] = (uint8_t)(raw & 0xFFU);
@@ -695,8 +718,8 @@ static void process_usb_command(const struct device *usb_dev,
         float distance_z_mm = 0.0f;
         unsigned laser1 = 0;
         unsigned laser2 = 0;
-        int16_t angle_c_deci = 0;
-        int16_t angle_a_deci = 0;
+        int32_t angle_c_centi = 0;
+        int32_t angle_a_centi = 0;
         int16_t distance_z_centi = 0;
         bool force_sync = (strncmp(cmd, "UF ", 3) == 0 || strncmp(cmd, "uf ", 3) == 0);
 
@@ -704,36 +727,56 @@ static void process_usb_command(const struct device *usb_dev,
                             &node_id, &angle_c_deg, &angle_a_deg, &distance_z_mm,
                             &laser1, &laser2);
         if (parsed != 6 || laser1 > 4095U || laser2 > 4095U ||
-            !encode_sync_fixed(angle_c_deg, 10.0f, &angle_c_deci) ||
-            !encode_sync_fixed(angle_a_deg, 10.0f, &angle_a_deci) ||
+            !encode_sync_fixed_i32(angle_c_deg, 100.0f, -262144, 262143, &angle_c_centi) ||
+            !encode_sync_fixed_i32(angle_a_deg, 100.0f, -262144, 262143, &angle_a_centi) ||
             !encode_sync_fixed(distance_z_mm, 100.0f, &distance_z_centi)) {
             write_invalid_argument(usb_dev, "UNIFIED");
             return;
         }
 
-        /* 1. Frame de movimento com coordenadas absolutas */
+        /* 1. Frame de movimento com coordenadas absolutas em centésimos de grau (C/A em 19-bit assinado: +-2621.43 deg)
+         * e centésimos de mm (Z em 16-bit: 0..327.67 mm).
+         * Byte 7: bit0=force_sync, bits 1..3=C bits 16..18, bits 4..6=A bits 16..18. */
         uint8_t move_payload[8];
-        move_payload[0] = CAN_OP_MOVE_SYNC;
-        encode_i16_le(&move_payload[1], angle_c_deci);
-        encode_i16_le(&move_payload[3], angle_a_deci);
+        uint32_t c_u19 = (uint32_t)angle_c_centi & 0x7FFFFU;
+        uint32_t a_u19 = (uint32_t)angle_a_centi & 0x7FFFFU;
+        move_payload[0] = CAN_OP_MOVE_UNIFIED;
+        move_payload[1] = (uint8_t)(c_u19 & 0xFFU);
+        move_payload[2] = (uint8_t)((c_u19 >> 8) & 0xFFU);
+        move_payload[3] = (uint8_t)(a_u19 & 0xFFU);
+        move_payload[4] = (uint8_t)((a_u19 >> 8) & 0xFFU);
         encode_i16_le(&move_payload[5], distance_z_centi);
-        move_payload[7] = force_sync ? 0x01U : 0x00U;
+        uint8_t c_hi = (uint8_t)((c_u19 >> 16) & 0x07U);
+        uint8_t a_hi = (uint8_t)((a_u19 >> 16) & 0x07U);
+        move_payload[7] = (force_sync ? 0x01U : 0x00U) | (uint8_t)(c_hi << 1) | (uint8_t)(a_hi << 4);
         int ret_m = send_can_command_ex(usb_dev, can_dev, node_id, move_payload,
                                         ARRAY_SIZE(move_payload), CAN_TX_BUSY_RETRIES_NORMAL);
 
-        /* 2. Frame de controle simultâneo dos 2 lasers */
-        uint8_t laser_payload[5];
-        laser_payload[0] = CAN_OP_LASER_DUAL;
-        laser_payload[1] = (uint8_t)(laser1 & 0xFFU);
-        laser_payload[2] = (uint8_t)((laser1 >> 8) & 0x0FU);
-        laser_payload[3] = (uint8_t)(laser2 & 0xFFU);
-        laser_payload[4] = (uint8_t)((laser2 >> 8) & 0x0FU);
-        int ret_l = send_can_command_ex(usb_dev, can_dev, node_id, laser_payload,
+        /* 2. Frame de controle simultâneo dos 2 lasers (apenas se houve alteração nos níveis para economizar 50% de banda CAN) */
+        int ret_l = 0;
+        bool laser_changed = (node_id <= CAN_NODE_ID_MAX) &&
+                             (!node_laser_cached[node_id] ||
+                              node_last_laser1[node_id] != (uint16_t)laser1 ||
+                              node_last_laser2[node_id] != (uint16_t)laser2);
+        if (laser_changed) {
+            uint8_t laser_payload[5];
+            laser_payload[0] = CAN_OP_LASER_DUAL;
+            laser_payload[1] = (uint8_t)(laser1 & 0xFFU);
+            laser_payload[2] = (uint8_t)((laser1 >> 8) & 0x0FU);
+            laser_payload[3] = (uint8_t)(laser2 & 0xFFU);
+            laser_payload[4] = (uint8_t)((laser2 >> 8) & 0x0FU);
+            ret_l = send_can_command_ex(usb_dev, can_dev, node_id, laser_payload,
                                         ARRAY_SIZE(laser_payload), CAN_TX_BUSY_RETRIES_CHAINED);
+            if (ret_l == 0 && node_id <= CAN_NODE_ID_MAX) {
+                node_last_laser1[node_id] = (uint16_t)laser1;
+                node_last_laser2[node_id] = (uint16_t)laser2;
+                node_laser_cached[node_id] = true;
+            }
+        }
 
         if (ret_m == 0 && ret_l == 0) {
             char reply_buf[80];
-            snprintf(reply_buf, sizeof(reply_buf), "TEENSY_OK U %u %.1f %.1f %.2f %u %u\r\n",
+            snprintf(reply_buf, sizeof(reply_buf), "TEENSY_OK U %u %.2f %.2f %.2f %u %u\r\n",
                      node_id, (double)angle_c_deg, (double)angle_a_deg, (double)distance_z_mm,
                      laser1, laser2);
             write_usb_serial(usb_dev, reply_buf);
